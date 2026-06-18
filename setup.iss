@@ -47,7 +47,9 @@ DisableProgramGroupPage=yes
 DisableDirPage=yes
 
 OutputDir=Output
-OutputBaseFilename=CoworkBridge-Setup-{#MyAppVersion}
+; Nom de fichier STABLE (sans version) : permet une URL de téléchargement
+; permanente « latest ». La version vit dans le tag + les métadonnées de l'.exe.
+OutputBaseFilename=CoworkBridge-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
