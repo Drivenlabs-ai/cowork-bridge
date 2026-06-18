@@ -1,0 +1,89 @@
+name: Build installer
+
+# Compile l'installeur Windows (Inno Setup) sur un runner Windows GitHub-hébergé.
+# - push sur main / workflow_dispatch : build + artefact (vérification).
+# - tag v* : build + Release GitHub avec l'.exe attaché.
+# Signature de code : automatique SI les secrets CODE_SIGN_PFX_BASE64 +
+#   CODE_SIGN_PASSWORD sont définis (sinon build non signé, sans échec).
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # nécessaire pour créer une Release sur tag
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $v = $env:GITHUB_REF -replace '^refs/tags/v',''
+          } else {
+            $v = '0.0.0-dev'
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Version: $v"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC introuvable : $iscc" }
+          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.version }}" "setup.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Échec compilation Inno Setup (code $LASTEXITCODE)" }
+          Get-ChildItem Output
+
+      - name: Check signing secret
+        id: sign
+        shell: pwsh
+        run: |
+          $has = -not [string]::IsNullOrEmpty($env:PFX)
+          "enabled=$($has.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if (-not $has) { Write-Host "Pas de certificat configuré -> build non signé." }
+        env:
+          PFX: ${{ secrets.CODE_SIGN_PFX_BASE64 }}
+
+      - name: Sign installer
+        if: steps.sign.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:PFX))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+                      Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool introuvable" }
+          $exe = (Get-ChildItem Output\*.exe | Select-Object -First 1).FullName
+          & $signtool sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:PFXPASS `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "$exe"
+          if ($LASTEXITCODE -ne 0) { throw "Échec signature (code $LASTEXITCODE)" }
+          Remove-Item "$env:RUNNER_TEMP\cert.pfx" -Force
+        env:
+          PFX: ${{ secrets.CODE_SIGN_PFX_BASE64 }}
+          PFXPASS: ${{ secrets.CODE_SIGN_PASSWORD }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoworkBridge-Setup
+          path: Output/*.exe
+          if-no-files-found: error
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: gh release create "$env:GITHUB_REF_NAME" Output\*.exe --title "Cowork Bridge $env:GITHUB_REF_NAME" --notes "Installeur Cowork Bridge $env:GITHUB_REF_NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}

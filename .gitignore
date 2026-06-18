@@ -1,0 +1,12 @@
+# Sortie de compilation Inno Setup
+Output/
+*.exe
+
+# Certificats / secrets de signature (ne JAMAIS committer)
+*.pfx
+*.p12
+*.key
+
+# Cruft OS
+.DS_Store
+Thumbs.db
