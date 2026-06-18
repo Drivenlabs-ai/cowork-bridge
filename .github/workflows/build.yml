@@ -54,41 +54,37 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Échec compilation Inno Setup (code $LASTEXITCODE)" }
           Get-ChildItem Output
 
+      # Signature de code via Azure Artifact Signing (ex-Trusted Signing) : clé en
+      # HSM cloud (conforme à l'obligation hardware depuis 2023), pas de .pfx.
+      # S'active dès que les 6 secrets AZURE_* sont définis dans le dépôt.
       - name: Check signing secret
         id: sign
         shell: pwsh
         run: |
-          $has = -not [string]::IsNullOrEmpty($env:PFX)
+          $has = -not [string]::IsNullOrEmpty($env:AZ_SECRET)
           "enabled=$($has.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          if (-not $has) { Write-Host "Pas de certificat configuré -> build non signé." }
+          if (-not $has) { Write-Host "Secrets Azure Artifact Signing absents -> build non signé." }
         env:
-          PFX: ${{ secrets.CODE_SIGN_PFX_BASE64 }}
+          AZ_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
 
-      - name: Sign installer
+      - name: Sign installer (Azure Artifact Signing)
         if: steps.sign.outputs.enabled == 'true'
-        shell: pwsh
-        run: |
-          $pfxPath = "$env:RUNNER_TEMP\cert.pfx"
-          try {
-            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:PFX))
-            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-                        Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
-            if (-not $signtool) { throw "signtool introuvable" }
-            $exe = (Get-ChildItem Output\*.exe | Select-Object -First 1).FullName
-            & $signtool sign /f $pfxPath /p $env:PFXPASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "$exe"
-            if ($LASTEXITCODE -ne 0) { throw "Échec signature (code $LASTEXITCODE)" }
-          } finally {
-            if (Test-Path $pfxPath) { Remove-Item $pfxPath -Force }
-          }
-        env:
-          PFX: ${{ secrets.CODE_SIGN_PFX_BASE64 }}
-          PFXPASS: ${{ secrets.CODE_SIGN_PASSWORD }}
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_CODE_SIGNING_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\Output
+          files-folder-filter: exe
 
       - name: Require signed build on release tags
         if: startsWith(github.ref, 'refs/tags/v') && steps.sign.outputs.enabled != 'true'
         shell: pwsh
         run: |
-          Write-Host "::error::Tag de release mais build NON signé (secrets CODE_SIGN_* absents). On ne publie pas un installeur non signé. Configure le certificat, ou distribue l'artefact de build pour les tests."
+          Write-Host "::error::Tag de release mais signature Azure non configurée (secrets AZURE_* absents). On ne publie pas un installeur non signé."
           exit 1
 
       - name: Upload artifact
