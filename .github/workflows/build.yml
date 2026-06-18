@@ -26,10 +26,11 @@ jobs:
         id: ver
         shell: pwsh
         run: |
+          # VersionInfoVersion (Inno) exige une version purement numérique a.b.c[.d].
           if ($env:GITHUB_REF -like 'refs/tags/v*') {
             $v = $env:GITHUB_REF -replace '^refs/tags/v',''
           } else {
-            $v = '0.0.0-dev'
+            $v = '0.0.0'
           }
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Version: $v"
