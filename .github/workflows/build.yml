@@ -4,7 +4,8 @@ name: Build installer
 # - push sur main / workflow_dispatch : build + artefact (vérification).
 # - tag v* : build + Release GitHub avec l'.exe attaché.
 # Signature de code : automatique SI les secrets CODE_SIGN_PFX_BASE64 +
-#   CODE_SIGN_PASSWORD sont définis (sinon build non signé, sans échec).
+#   CODE_SIGN_PASSWORD sont définis. Un tag v* NON signé échoue volontairement
+#   (on ne publie jamais un installeur non signé).
 
 on:
   push:
@@ -12,39 +13,44 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Moindre privilège par défaut ; l'écriture (Release) est accordée au seul job release.
 permissions:
-  contents: write   # nécessaire pour créer une Release sur tag
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Determine version
         id: ver
         shell: pwsh
         run: |
-          # VersionInfoVersion (Inno) exige une version purement numérique a.b.c[.d].
           if ($env:GITHUB_REF -like 'refs/tags/v*') {
             $v = $env:GITHUB_REF -replace '^refs/tags/v',''
           } else {
             $v = '0.0.0'
           }
+          # VersionInfoVersion (Inno) exige une version purement numérique a.b.c[.d] :
+          # on en dérive une, même si le tag porte un suffixe (ex. 1.2.0-rc1 -> 1.2.0).
+          $m = [regex]::Match($v, '^\d+(\.\d+){0,3}')
+          $vnum = if ($m.Success) { $m.Value } else { '0.0.0' }
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Version: $v"
+          "vnum=$vnum" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Version: $v (info: $vnum)"
 
       - name: Install Inno Setup
         shell: pwsh
-        run: choco install innosetup -y --no-progress
+        run: choco install innosetup --version=6.7.1 -y --no-progress
 
       - name: Compile installer
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "ISCC introuvable : $iscc" }
-          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.version }}" "setup.iss"
+          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/DMyAppVersionInfo=${{ steps.ver.outputs.vnum }}" "setup.iss"
           if ($LASTEXITCODE -ne 0) { throw "Échec compilation Inno Setup (code $LASTEXITCODE)" }
           Get-ChildItem Output
 
@@ -62,29 +68,56 @@ jobs:
         if: steps.sign.outputs.enabled == 'true'
         shell: pwsh
         run: |
-          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:PFX))
-          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-                      Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $signtool) { throw "signtool introuvable" }
-          $exe = (Get-ChildItem Output\*.exe | Select-Object -First 1).FullName
-          & $signtool sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:PFXPASS `
-            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "$exe"
-          if ($LASTEXITCODE -ne 0) { throw "Échec signature (code $LASTEXITCODE)" }
-          Remove-Item "$env:RUNNER_TEMP\cert.pfx" -Force
+          $pfxPath = "$env:RUNNER_TEMP\cert.pfx"
+          try {
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:PFX))
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+                        Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+            if (-not $signtool) { throw "signtool introuvable" }
+            $exe = (Get-ChildItem Output\*.exe | Select-Object -First 1).FullName
+            & $signtool sign /f $pfxPath /p $env:PFXPASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "$exe"
+            if ($LASTEXITCODE -ne 0) { throw "Échec signature (code $LASTEXITCODE)" }
+          } finally {
+            if (Test-Path $pfxPath) { Remove-Item $pfxPath -Force }
+          }
         env:
           PFX: ${{ secrets.CODE_SIGN_PFX_BASE64 }}
           PFXPASS: ${{ secrets.CODE_SIGN_PASSWORD }}
 
+      - name: Require signed build on release tags
+        if: startsWith(github.ref, 'refs/tags/v') && steps.sign.outputs.enabled != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "::error::Tag de release mais build NON signé (secrets CODE_SIGN_* absents). On ne publie pas un installeur non signé. Configure le certificat, ou distribue l'artefact de build pour les tests."
+          exit 1
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: CoworkBridge-Setup
           path: Output/*.exe
           if-no-files-found: error
 
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # écriture limitée à ce job (création de la Release)
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: CoworkBridge-Setup
+          path: dist
       - name: Create release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: gh release create "$env:GITHUB_REF_NAME" Output\*.exe --title "Cowork Bridge $env:GITHUB_REF_NAME" --notes "Installeur Cowork Bridge $env:GITHUB_REF_NAME"
+        shell: bash
+        run: |
+          exe="$(ls dist/*.exe | head -n1)"
+          if [ -z "$exe" ]; then echo "Aucun .exe trouvé"; exit 1; fi
+          gh release create "$GITHUB_REF_NAME" "$exe" \
+            --title "Cowork Bridge $GITHUB_REF_NAME" \
+            --notes "Installeur Cowork Bridge $GITHUB_REF_NAME"
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

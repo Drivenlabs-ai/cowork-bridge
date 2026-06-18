@@ -180,7 +180,7 @@ function New-FfsBatch {
     param(
         [object[]]$Pairs,
         [string]$OutPath,
-        [ValidateSet('TwoWay','Mirror')][string]$Variant = 'TwoWay'
+        [ValidateSet('TwoWay','Mirror','Update')][string]$Variant = 'TwoWay'
     )
 
     $pairBlocks = foreach ($p in $Pairs) {
@@ -383,7 +383,11 @@ function Invoke-Install {
         ffsRts    = $Ffs.Rts
         batch     = $batchPath
         real      = $realPath
-        sources   = @($Selected | ForEach-Object { @{ Type = $_.Type; Name = $_.Name; Path = $_.Path } })
+        # LocalName persiste le nom de dossier local REEL (préfixe + sanitization +
+        # suffixe anti-collision) pour que la libération d'espace supprime le bon
+        # dossier sans le recalculer. @(...) force un tableau JSON ; au reload via
+        # ConvertFrom-Json, toujours réaccéder en @($Config.sources).
+        sources   = @($pairs | ForEach-Object { @{ Type = $_.Source.Type; Name = $_.Source.Name; Path = $_.Source.Path; LocalName = $_.LocalName } })
         installed = (Get-Date -Format 's')
     })
 
@@ -659,33 +663,52 @@ function Start-Bridge {
     # 5. nettoyage des dossiers retires (modification de selection)
     if ($existing) {
         $newPaths = @($choice.Selected | ForEach-Object { $_.Path })
+        # @() requis : ConvertFrom-Json renvoie un scalaire pour un sources mono-element.
         $removed = @($existing.sources | Where-Object { $newPaths -notcontains $_.Path })
         if ($removed.Count -gt 0) {
             $m = "Tu as retiré $($removed.Count) dossier(s) de la sélection." + [Environment]::NewLine + [Environment]::NewLine +
-                 "Ils ne seront plus synchronisés et leur copie locale sera supprimée pour" + [Environment]::NewLine +
-                 "libérer de l'espace. Tes fichiers restent en sécurité dans Google Drive —" + [Environment]::NewLine +
-                 "rien n'est perdu, ils sont toujours dans le cloud (et la suppression locale" + [Environment]::NewLine +
-                 "passe par la corbeille)." + [Environment]::NewLine + [Environment]::NewLine +
-                 "Faire une dernière synchro puis libérer l'espace ?"
+                 "Leur contenu local va d'abord être sauvegardé vers Google Drive, puis la copie" + [Environment]::NewLine +
+                 "locale sera envoyée à la corbeille pour libérer de l'espace. Aucun fichier n'est" + [Environment]::NewLine +
+                 "perdu : rien n'est supprimé côté Drive, et la suppression locale est récupérable." + [Environment]::NewLine + [Environment]::NewLine +
+                 "Sauvegarder puis libérer l'espace ?"
             if (Confirm-YesNo $m) {
                 $script:LogFile = Join-Path (Get-MetaDir $existing.dest) 'bridge.log'
-                $synced = $false
-                try {
-                    $p = Start-Process -FilePath $existing.ffsExe -ArgumentList ('"{0}"' -f $existing.batch) -PassThru -Wait
-                    $synced = ([int]$p.ExitCode -le 1)   # 0 = ok, 1 = avertissements
-                    Write-Log "Synchro avant liberation, code $($p.ExitCode)"
-                } catch { Write-Log "Synchro avant liberation echouee: $($_.Exception.Message)" 'WARN' }
 
-                if (-not $synced) {
-                    Show-Warn("La dernière synchronisation n'a pas abouti correctement." + [Environment]::NewLine +
+                # Nom de dossier local RÉEL : persisté en config (LocalName) ; recalcul
+                # de repli pour une config antérieure qui ne le porterait pas.
+                $removedInfo = foreach ($r in $removed) {
+                    $hasLn = ($r.PSObject.Properties.Name -contains 'LocalName') -and $r.LocalName
+                    $ln = if ($hasLn) { $r.LocalName }
+                          else {
+                              $prefix = if ($r.Type -eq 'Shared') { 'Partage - ' } else { '' }
+                              ($prefix + $r.Name) -replace '[\\/:*?"<>|]', '_'
+                          }
+                    [pscustomobject]@{ Local = (Join-Path $existing.dest $ln); Drive = $r.Path }
+                }
+
+                # Sauvegarde AVANT suppression : Update local -> Drive (copie seulement,
+                # ne supprime jamais rien). On ne relance PAS le batch TwoWay global,
+                # qui pourrait propager une suppression locale vers Drive.
+                $pushPairs = @($removedInfo | Where-Object { Test-Path $_.Local } |
+                               ForEach-Object { [pscustomobject]@{ Left = $_.Local; Right = $_.Drive } })
+                $pushed = $true
+                if ($pushPairs.Count -gt 0) {
+                    $pushBatch = Join-Path (Get-MetaDir $existing.dest) 'bridge-release.ffs_batch'
+                    New-FfsBatch -Pairs $pushPairs -OutPath $pushBatch -Variant 'Update'
+                    try {
+                        $p = Start-Process -FilePath $existing.ffsExe -ArgumentList ('"{0}"' -f $pushBatch) -PassThru -Wait
+                        $pushed = ([int]$p.ExitCode -le 1)   # 0 = ok, 1 = avertissements
+                        Write-Log "Sauvegarde avant liberation (Update local -> Drive), code $($p.ExitCode)"
+                    } catch { $pushed = $false; Write-Log "Sauvegarde avant liberation echouee: $($_.Exception.Message)" 'WARN' }
+                }
+
+                if (-not $pushed) {
+                    Show-Warn("La sauvegarde vers Google Drive n'a pas abouti." + [Environment]::NewLine +
                               "Par sécurité, les copies locales NE sont PAS supprimées (aucune perte).")
                 } else {
-                    foreach ($r in $removed) {
-                        $prefix = if ($r.Type -eq 'Shared') { 'Partage - ' } else { '' }
-                        $localName = ($prefix + $r.Name) -replace '[\\/:*?"<>|]', '_'
-                        $lp = Join-Path $existing.dest $localName
-                        if (Test-Path $lp) {
-                            try { Remove-ToRecycleBin $lp } catch { Write-Log "Liberation locale echouee (corbeille): $lp ($($_.Exception.Message))" 'WARN' }
+                    foreach ($ri in $removedInfo) {
+                        if (Test-Path $ri.Local) {
+                            try { Remove-ToRecycleBin $ri.Local } catch { Write-Log "Liberation locale echouee (corbeille): $($ri.Local) ($($_.Exception.Message))" 'WARN' }
                         }
                     }
                 }

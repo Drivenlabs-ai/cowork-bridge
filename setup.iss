@@ -16,10 +16,14 @@
 
 #define MyAppName "Drivenlabs Cowork Bridge"
 #define MyAppShortName "Cowork Bridge"
-; MyAppVersion peut être injecté par la CI via ISCC /DMyAppVersion=x.y.z ;
-; sinon valeur par défaut pour une compilation locale.
+; MyAppVersion (affichage, peut porter un suffixe) et MyAppVersionInfo (numérique
+; pur, pour VersionInfoVersion) sont injectés par la CI via ISCC /D... ; sinon
+; valeurs par défaut pour une compilation locale.
 #ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
+#endif
+#ifndef MyAppVersionInfo
+  #define MyAppVersionInfo "1.0.0"
 #endif
 #define MyAppPublisher "Drivenlabs"
 #define MyAppURL "https://drivenlabs.fr"
@@ -30,7 +34,7 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
-VersionInfoVersion={#MyAppVersion}
+VersionInfoVersion={#MyAppVersionInfo}
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} Setup
 
