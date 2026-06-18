@@ -229,11 +229,11 @@ $pairsXml
     </FolderPairs>
     <Errors Ignore="true" Retry="2" Delay="5"/>
     <PostSyncCommand Condition="Completion"/>
+    <LogFolder/>
     <Batch>
         <ProgressDialog Minimized="true" AutoClose="true"/>
         <ErrorDialog>Show</ErrorDialog>
         <PostSyncAction>None</PostSyncAction>
-        <LogfileFolder MaxCount="0"/>
     </Batch>
 </FreeFileSync>
 "@
@@ -441,7 +441,7 @@ function Show-SelectionDialog {
 
     $clb = New-Object System.Windows.Forms.CheckedListBox
     $clb.Location = New-Object System.Drawing.Point(15, 74)
-    $clb.Size = New-Object System.Drawing.Size(575, 320)
+    $clb.Size = New-Object System.Drawing.Size(575, 283)
     $clb.CheckOnClick = $true
     $clb.IntegralHeight = $false
 
@@ -456,6 +456,34 @@ function Show-SelectionDialog {
         if ($preset.ContainsKey($s.Path)) { $clb.SetItemChecked($idx, $true) }
     }
     $form.Controls.Add($clb)
+
+    # Parcourir : cibler n'importe quel dossier (ex. un sous-dossier précis) via l'explorateur
+    $btnBrowse = New-Object System.Windows.Forms.Button
+    $btnBrowse.Text = 'Parcourir un dossier…'
+    $btnBrowse.Location = New-Object System.Drawing.Point(15, 363)
+    $btnBrowse.Size = New-Object System.Drawing.Size(230, 28)
+    $form.Controls.Add($btnBrowse)
+    $btnBrowse.Add_Click({
+        $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+        $fbd.Description = 'Choisis un dossier (dans Google Drive) à rendre accessible à Cowork'
+        $fbd.ShowNewFolderButton = $false
+        if ($rows.Count -gt 0) { try { $fbd.SelectedPath = (Split-Path $rows[0].Path -Parent) } catch {} }
+        if ($fbd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $p = $fbd.SelectedPath
+            $found = $false
+            for ($i = 0; $i -lt $rows.Count; $i++) {
+                if ($rows[$i].Path -eq $p) { $clb.SetItemChecked($i, $true); $found = $true; break }
+            }
+            if (-not $found) {
+                $t = if ($p -like '*\Shared drives\*' -or $p -like '*\Drive partag*' -or $p -like '*\Disques partag*') { 'Shared' } else { 'MyDrive' }
+                $tag = if ($t -eq 'Shared') { '[Partagé] ' } else { '[Mon Drive] ' }
+                $leaf = Split-Path $p -Leaf
+                $idx = $clb.Items.Add($tag + $leaf)
+                $rows.Add([pscustomobject]@{ Type = $t; Name = $leaf; Path = $p })
+                $clb.SetItemChecked($idx, $true)
+            }
+        }
+    })
 
     # destination
     $lblDest = New-Object System.Windows.Forms.Label
@@ -545,54 +573,68 @@ function Show-ManageDialog {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "$script:AppName - Gestion"
-    $form.Size = New-Object System.Drawing.Size(540, 420)
+    $form.Size = New-Object System.Drawing.Size(560, 545)
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
-    $lbl = New-Object System.Windows.Forms.Label
     $count = @($Config.sources).Count
+    $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = "Cowork Bridge est actif." + [Environment]::NewLine +
                 "Dossier de travail : $($Config.dest)" + [Environment]::NewLine +
-                "Dossiers suivis : $count" + [Environment]::NewLine + [Environment]::NewLine +
+                "Synchronisation automatique : toutes les $($Config.interval) min" + [Environment]::NewLine + [Environment]::NewLine +
                 "À connecter dans Cowork (et surtout pas le dossier Google Drive) :" + [Environment]::NewLine +
                 "$($Config.dest)"
     $lbl.Location = New-Object System.Drawing.Point(20, 18)
-    $lbl.Size = New-Object System.Drawing.Size(490, 110)
+    $lbl.Size = New-Object System.Drawing.Size(510, 95)
     $form.Controls.Add($lbl)
+
+    $lblList = New-Object System.Windows.Forms.Label
+    $lblList.Text = "Dossiers suivis ($count) :"
+    $lblList.Location = New-Object System.Drawing.Point(20, 116); $lblList.Size = New-Object System.Drawing.Size(510, 18)
+    $form.Controls.Add($lblList)
+
+    $list = New-Object System.Windows.Forms.ListBox
+    $list.Location = New-Object System.Drawing.Point(20, 136); $list.Size = New-Object System.Drawing.Size(510, 118)
+    $list.IntegralHeight = $false; $list.HorizontalScrollbar = $true
+    foreach ($s in (@($Config.sources) | Sort-Object Type, Name)) {
+        $tag = if ($s.Type -eq 'Shared') { '[Partagé] ' } else { '[Mon Drive] ' }
+        [void]$list.Items.Add($tag + $s.Name)
+    }
+    $form.Controls.Add($list)
 
     $btnAdd = New-Object System.Windows.Forms.Button
     $btnAdd.Text = 'Ajouter un dossier'
-    $btnAdd.Location = New-Object System.Drawing.Point(20, 138); $btnAdd.Size = New-Object System.Drawing.Size(230, 34)
+    $btnAdd.Location = New-Object System.Drawing.Point(20, 268); $btnAdd.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnAdd)
 
     $btnSync = New-Object System.Windows.Forms.Button
     $btnSync.Text = 'Synchroniser maintenant'
-    $btnSync.Location = New-Object System.Drawing.Point(270, 138); $btnSync.Size = New-Object System.Drawing.Size(230, 34)
+    $btnSync.Location = New-Object System.Drawing.Point(285, 268); $btnSync.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnSync)
 
     $btnEdit = New-Object System.Windows.Forms.Button
     $btnEdit.Text = 'Modifier la sélection'
-    $btnEdit.Location = New-Object System.Drawing.Point(20, 180); $btnEdit.Size = New-Object System.Drawing.Size(230, 34)
+    $btnEdit.Location = New-Object System.Drawing.Point(20, 310); $btnEdit.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnEdit)
 
     $btnOpen = New-Object System.Windows.Forms.Button
     $btnOpen.Text = 'Ouvrir le dossier local'
-    $btnOpen.Location = New-Object System.Drawing.Point(270, 180); $btnOpen.Size = New-Object System.Drawing.Size(230, 34)
+    $btnOpen.Location = New-Object System.Drawing.Point(285, 310); $btnOpen.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnOpen)
 
     $btnUninstall = New-Object System.Windows.Forms.Button
     $btnUninstall.Text = 'Désinstaller Cowork Bridge'
-    $btnUninstall.Location = New-Object System.Drawing.Point(20, 222); $btnUninstall.Size = New-Object System.Drawing.Size(230, 34)
+    $btnUninstall.Location = New-Object System.Drawing.Point(20, 352); $btnUninstall.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnUninstall)
 
     $status = New-Object System.Windows.Forms.Label
-    $status.Location = New-Object System.Drawing.Point(20, 268); $status.Size = New-Object System.Drawing.Size(490, 50)
+    $status.Location = New-Object System.Drawing.Point(20, 398); $status.Size = New-Object System.Drawing.Size(510, 50)
     $status.ForeColor = [System.Drawing.Color]::DimGray
     $form.Controls.Add($status)
 
     $btnClose = New-Object System.Windows.Forms.Button
     $btnClose.Text = 'Fermer'
-    $btnClose.Location = New-Object System.Drawing.Point(420, 330); $btnClose.Size = New-Object System.Drawing.Size(90, 30)
+    $btnClose.Location = New-Object System.Drawing.Point(440, 458); $btnClose.Size = New-Object System.Drawing.Size(90, 30)
     $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $form.Controls.Add($btnClose)
 
