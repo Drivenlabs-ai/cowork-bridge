@@ -322,10 +322,13 @@ function Load-Config { param([string]$Dest)
 }
 
 # Construit la liste des paires + dossiers locaux, avec garde anti-collision de noms.
+# Tri déterministe (Type, Name) : l'attribution des noms locaux (et des éventuels
+# suffixes anti-collision) reste stable d'un run à l'autre quel que soit l'ordre
+# d'entrée — indispensable pour que l'ajout d'un dossier ne renomme pas les existants.
 function Build-Pairs { param([object[]]$Selected, [string]$Dest)
     $pairs = New-Object System.Collections.Generic.List[object]
     $used  = New-Object System.Collections.Generic.HashSet[string]
-    foreach ($s in $Selected) {
+    foreach ($s in ($Selected | Sort-Object Type, Name)) {
         $prefix = if ($s.Type -eq 'Shared') { 'Partage - ' } else { '' }
         $base   = ($prefix + $s.Name) -replace '[\\/:*?"<>|]', '_'
         $localName = $base
@@ -542,7 +545,7 @@ function Show-ManageDialog {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "$script:AppName - gestion"
-    $form.Size = New-Object System.Drawing.Size(540, 380)
+    $form.Size = New-Object System.Drawing.Size(540, 420)
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
@@ -557,34 +560,39 @@ function Show-ManageDialog {
     $lbl.Size = New-Object System.Drawing.Size(490, 110)
     $form.Controls.Add($lbl)
 
+    $btnAdd = New-Object System.Windows.Forms.Button
+    $btnAdd.Text = 'Ajouter un dossier'
+    $btnAdd.Location = New-Object System.Drawing.Point(20, 138); $btnAdd.Size = New-Object System.Drawing.Size(230, 34)
+    $form.Controls.Add($btnAdd)
+
     $btnSync = New-Object System.Windows.Forms.Button
     $btnSync.Text = 'Synchroniser maintenant'
-    $btnSync.Location = New-Object System.Drawing.Point(20, 138); $btnSync.Size = New-Object System.Drawing.Size(230, 34)
+    $btnSync.Location = New-Object System.Drawing.Point(270, 138); $btnSync.Size = New-Object System.Drawing.Size(230, 34)
     $form.Controls.Add($btnSync)
 
     $btnEdit = New-Object System.Windows.Forms.Button
     $btnEdit.Text = 'Modifier la sélection'
-    $btnEdit.Location = New-Object System.Drawing.Point(270, 138); $btnEdit.Size = New-Object System.Drawing.Size(230, 34)
+    $btnEdit.Location = New-Object System.Drawing.Point(20, 180); $btnEdit.Size = New-Object System.Drawing.Size(230, 34)
     $form.Controls.Add($btnEdit)
 
     $btnOpen = New-Object System.Windows.Forms.Button
     $btnOpen.Text = 'Ouvrir le dossier local'
-    $btnOpen.Location = New-Object System.Drawing.Point(20, 180); $btnOpen.Size = New-Object System.Drawing.Size(230, 34)
+    $btnOpen.Location = New-Object System.Drawing.Point(270, 180); $btnOpen.Size = New-Object System.Drawing.Size(230, 34)
     $form.Controls.Add($btnOpen)
 
     $btnUninstall = New-Object System.Windows.Forms.Button
     $btnUninstall.Text = 'Désinstaller Cowork Bridge'
-    $btnUninstall.Location = New-Object System.Drawing.Point(270, 180); $btnUninstall.Size = New-Object System.Drawing.Size(230, 34)
+    $btnUninstall.Location = New-Object System.Drawing.Point(20, 222); $btnUninstall.Size = New-Object System.Drawing.Size(230, 34)
     $form.Controls.Add($btnUninstall)
 
     $status = New-Object System.Windows.Forms.Label
-    $status.Location = New-Object System.Drawing.Point(20, 226); $status.Size = New-Object System.Drawing.Size(490, 60)
+    $status.Location = New-Object System.Drawing.Point(20, 268); $status.Size = New-Object System.Drawing.Size(490, 50)
     $status.ForeColor = [System.Drawing.Color]::DimGray
     $form.Controls.Add($status)
 
     $btnClose = New-Object System.Windows.Forms.Button
     $btnClose.Text = 'Fermer'
-    $btnClose.Location = New-Object System.Drawing.Point(420, 298); $btnClose.Size = New-Object System.Drawing.Size(90, 30)
+    $btnClose.Location = New-Object System.Drawing.Point(420, 330); $btnClose.Size = New-Object System.Drawing.Size(90, 30)
     $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $form.Controls.Add($btnClose)
 
@@ -598,6 +606,7 @@ function Show-ManageDialog {
         } catch { $status.Text = "La synchronisation n'a pas pu démarrer : $($_.Exception.Message)" }
     })
     $btnOpen.Add_Click({ Start-Process explorer.exe -ArgumentList ('"{0}"' -f $Config.dest) })
+    $btnAdd.Add_Click({ $script:ManageAction = 'add'; $form.Close() })
     $btnEdit.Add_Click({ $script:ManageAction = 'edit'; $form.Close() })
     $btnUninstall.Add_Click({ $script:ManageAction = 'uninstall'; $form.Close() })
 
@@ -626,11 +635,13 @@ function Start-Bridge {
 
     # 2. installation existante ?
     $existing = Load-Config -Dest $script:DefaultDest
+    $mode = 'install'
     if ($existing) {
         $action = Show-ManageDialog -Config $existing
         switch ($action) {
             'uninstall' { Invoke-Uninstall -Config $existing; return }
-            'edit'      { }   # continue vers la selection ci-dessous
+            'add'       { $mode = 'add' }    # ajouter un/des dossier(s) aux dossiers suivis
+            'edit'      { $mode = 'edit' }   # revoir toute la selection
             default     { return }
         }
     }
@@ -646,19 +657,30 @@ function Start-Bridge {
         return
     }
 
-    # 4. selection
-    $preChecked = $null
-    $dest = $script:DefaultDest
-    $interval = $script:DefaultInterval
-    $title = 'installation'; $okLabel = 'Installer'
-    if ($existing) {
-        $preChecked = $existing.sources
-        $dest = $existing.dest
-        $interval = [int]$existing.interval
-        $title = 'modifier la sélection'; $okLabel = 'Enregistrer'
+    # 4. selection (selon le mode)
+    if ($mode -eq 'add') {
+        # n'afficher que les dossiers PAS ENCORE suivis ; on ajoute sans rien retirer.
+        $trackedPaths = @($existing.sources | ForEach-Object { $_.Path })
+        $untracked = @($sources | Where-Object { $trackedPaths -notcontains $_.Path })
+        if ($untracked.Count -eq 0) {
+            Show-Info("Tous les dossiers Google Drive détectés sont déjà suivis." + [Environment]::NewLine +
+                      "Pour en suivre un nouveau, crée-le d'abord dans Google Drive, puis reviens ici.")
+            return
+        }
+        $choice = Show-SelectionDialog -Sources $untracked -PreChecked $null -Dest $existing.dest -Interval ([int]$existing.interval) -Title 'ajouter un dossier' -OkLabel 'Ajouter'
+        if (-not $choice) { return }
+        # union avec les dossiers déjà suivis ; dossier de travail inchangé, aucun retrait.
+        $choice.Selected = @($existing.sources) + @($choice.Selected)
+        $choice.Dest = $existing.dest
     }
-    $choice = Show-SelectionDialog -Sources $sources -PreChecked $preChecked -Dest $dest -Interval $interval -Title $title -OkLabel $okLabel
-    if (-not $choice) { return }
+    elseif ($mode -eq 'edit') {
+        $choice = Show-SelectionDialog -Sources $sources -PreChecked $existing.sources -Dest $existing.dest -Interval ([int]$existing.interval) -Title 'modifier la sélection' -OkLabel 'Enregistrer'
+        if (-not $choice) { return }
+    }
+    else {
+        $choice = Show-SelectionDialog -Sources $sources -PreChecked $null -Dest $script:DefaultDest -Interval $script:DefaultInterval -Title 'installation' -OkLabel 'Installer'
+        if (-not $choice) { return }
+    }
 
     # 5. nettoyage des dossiers retires (modification de selection)
     if ($existing) {

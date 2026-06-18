@@ -51,7 +51,9 @@ Pour forcer une synchro immédiate : relance `Run-CoworkBridge.bat` → **Synchr
 
 Le bridge **réduit** ton stockage si tu étais en mode Miroir (qui télécharge tout le Drive). En mode Stream + sélection ciblée, le local ne contient que les dossiers pontés.
 
-- **Ajouter / retirer des dossiers** : relance `Run-CoworkBridge.bat` → **Modifier la sélection**. Décocher un dossier lance une dernière synchro et, **si elle réussit**, envoie sa copie locale à la **corbeille** (récupérable). Si la synchro échoue, rien n'est supprimé.
+- **Ajouter un dossier** : ouvre Cowork Bridge (**icône du bureau** ou menu Démarrer → *Configurer Cowork Bridge*) → bouton **« Ajouter un dossier »** → coche le(s) nouveau(x) dossier(s) → **Ajouter**. Rien à retoucher dans Cowork : le nouveau dossier apparaît dans `CoworkWork`.
+- **Pas besoin d'ajouter un sous-dossier** : tout ce qui est créé **à l'intérieur** d'un dossier déjà suivi se synchronise automatiquement. Tu ne reviens ici que pour un nouveau dossier de **premier niveau**.
+- **Retirer un dossier** : même fenêtre → **Modifier la sélection** → décoche. Le contenu local est d'abord sauvegardé vers Drive, puis sa copie locale part à la **corbeille** (récupérable). Si la sauvegarde échoue, rien n'est supprimé.
 - **Espace occupé ≈ taille des dossiers cochés.** Jamais tout le Drive.
 - Le dossier `CoworkWork` n'est qu'un **cache de travail** : tout y est aussi dans Drive (et le cloud). Tu peux en vider un sous-dossier après une dernière synchro pour récupérer de la place.
 

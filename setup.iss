@@ -61,6 +61,10 @@ ArchitecturesInstallIn64BitMode=x64compatible
 [Languages]
 Name: "french"; MessagesFile: "compiler:Languages\French.isl"
 
+[Tasks]
+; Icône sur le bureau : proposée (cochée par défaut), jamais imposée.
+Name: "desktopicon"; Description: "Créer une icône sur le bureau"; GroupDescription: "Raccourcis :"
+
 [Files]
 Source: "Install-CoworkBridge.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Run-CoworkBridge.bat";     DestDir: "{app}"; Flags: ignoreversion
@@ -76,6 +80,13 @@ Name: "{group}\Configurer {#MyAppShortName}"; \
     Comment: "Ouvrir l'installeur / le panneau de gestion de Cowork Bridge"
 Name: "{group}\Guide {#MyAppShortName}"; Filename: "{app}\GUIDE.md"
 Name: "{group}\Désinstaller {#MyAppShortName}"; Filename: "{uninstallexe}"
+; Icône bureau (optionnelle via la tâche desktopicon), même lancement caché.
+Name: "{autodesktop}\{#MyAppShortName}"; \
+    Filename: "powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File ""{app}\Install-CoworkBridge.ps1"""; \
+    WorkingDir: "{app}"; \
+    Tasks: desktopicon; \
+    Comment: "Ouvrir Cowork Bridge"
 
 [Run]
 ; Proposer de lancer la configuration à la fin de l'installation.
