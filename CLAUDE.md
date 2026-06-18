@@ -41,6 +41,23 @@ Alternative évaluée et reportée en v2 : **rclone direct** (API Drive, sans Dr
 - **Licence FreeFileSync** : ⚠ NON redistribué dans l'installeur (donationware propriétaire, droits de redistribution à vérifier). v1 = détection + guidage par le script. Décision à prendre après vérif licence : bundler le portable, ou télécharger l'installeur officiel FFS à l'install (`/VERYSILENT`), ou rester en prérequis guidé.
 - **Icône** : `assets\app.ico` (lignes commentées dans `setup.iss`) — déposer le `.ico` Drivenlabs pour le branding, puis décommenter.
 
+## Déploiement client (checklist interne)
+
+Note : le repo est public, donc le `GUIDE.md` est grand public — cette checklist vit ici, pas dans le guide.
+
+1. **Prérequis machine** : Google Drive pour ordinateur (mode **« Accéder en ligne aux fichiers »**, surtout pas « Dupliquer les fichiers ») + FreeFileSync. Les pré-installer évite la friction.
+2. Donner au client l'`.exe` signé (Release GitHub une fois le cert posé ; d'ici là, l'artefact de build).
+3. Installer → cocher les dossiers métier + Drive partagés pertinents → connecter `CoworkWork` dans Cowork.
+4. **Valider** : ouvrir Cowork, vérifier que les fichiers sont **lisibles** (pas seulement listés — ouvrir un doc).
+5. Noter l'empreinte stockage = somme des dossiers cochés.
+
+Libellés Google Drive FR vérifiés (source officielle Google, juin 2026) : stream = « Accéder en ligne aux fichiers », miroir = « Dupliquer les fichiers », chemin « Paramètres → Préférences → Dossiers de Drive → Options de synchronisation de Mon Drive ». À reconfirmer sur la build installée chez le client (les libellés ont changé selon les versions).
+
+Limites connues :
+- Vaut pour Windows. Sur Mac le même mur existe (FileProvider) — le moteur FreeFileSync est cross-platform, mais l'installeur/PS est Windows-only (à porter si besoin).
+- C'est un **contournement**, pas un correctif Anthropic. À retirer le jour où Cowork supportera nativement les dossiers cloud (issues `area:cowork` du repo `anthropics/claude-code`).
+- Collision de noms de dossiers locaux : `Build-Pairs` trie de façon déterministe (stable dans tous les cas réalistes) ; un rename théorique ne survient que si deux dossiers de même type sanitizent vers le même nom (caractères illégaux) — quasi nul, non corrigé (réutiliser `LocalName` persisté fermerait le trou si besoin).
+
 ## Détails techniques vérifiés
 
 - `.ffs_batch` : `XmlType="BATCH" XmlFormat="13"` (FFS convertit les anciens formats vers l'avant). `Synchronize/Variant` = `TwoWay` (courant) ou `Mirror` (1er run), `DeletionPolicy=RecycleBin`, `Batch/ProgressDialog Minimized+AutoClose`, `Errors Ignore="true"` (c'est CE flag qui rend la synchro non bloquante en tâche planifiée ; `ErrorDialog` reste à la valeur vérifiée `Show` pour ne pas risquer un enum invalide qui ferait rejeter tout le batch). `LogfileFolder MaxCount="0"` self-closing = forme **exacte** d'un vrai fichier format-13 (NE PAS mettre `Limit`, qui est le format 17). Lancement : `FreeFileSync.exe "x.ffs_batch"` (codes 0=ok / 1=warn / 2=err / 3=annulé).

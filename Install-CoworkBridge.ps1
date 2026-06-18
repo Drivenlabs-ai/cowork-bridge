@@ -75,8 +75,8 @@ function Write-Log {
 function Get-SyncResultText([int]$code) {
     switch ($code) {
         0       { 'Synchronisation terminée. Tout est à jour.' }
-        1       { 'Synchronisation terminée (quelques avertissements). Tes fichiers sont généralement à jour.' }
-        default { 'La synchronisation a rencontré un problème. Relance « Synchroniser maintenant » ; si ça persiste, contacte le support.' }
+        1       { 'Synchronisation terminée. Quelques fichiers ont été ignorés (verrouillés ou temporaires) — sans impact sur ton travail.' }
+        default { 'La synchronisation a rencontré un problème. Relance « Synchroniser maintenant ». Si le problème persiste, contacte ton interlocuteur Drivenlabs.' }
     }
 }
 
@@ -422,7 +422,7 @@ function Invoke-Install {
 function Show-SelectionDialog {
     param(
         [object[]]$Sources, [object[]]$PreChecked, [string]$Dest, [int]$Interval,
-        [string]$Title = 'installation', [string]$OkLabel = 'Installer'
+        [string]$Title = 'Installation', [string]$OkLabel = 'Installer'
     )
 
     $form = New-Object System.Windows.Forms.Form
@@ -432,9 +432,9 @@ function Show-SelectionDialog {
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
     $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = "Cet outil rend tes dossiers Google Drive lisibles par Claude Cowork." + [Environment]::NewLine +
-                "Coche les dossiers à rendre disponibles. Seuls les dossiers cochés" + [Environment]::NewLine +
-                "occuperont de l'espace sur cet ordinateur (tout reste aussi dans Drive)."
+    $lbl.Text = "Cet outil rend tes dossiers Google Drive accessibles à Claude Cowork." + [Environment]::NewLine +
+                "Coche ceux à rendre accessibles. Seuls les dossiers cochés occuperont" + [Environment]::NewLine +
+                "de l'espace sur cet ordinateur (tout reste aussi dans Drive)."
     $lbl.Location = New-Object System.Drawing.Point(15, 12)
     $lbl.Size = New-Object System.Drawing.Size(585, 56)
     $form.Controls.Add($lbl)
@@ -459,7 +459,7 @@ function Show-SelectionDialog {
 
     # destination
     $lblDest = New-Object System.Windows.Forms.Label
-    $lblDest.Text = 'Dossier de travail local (doit rester dans ton dossier utilisateur) :'
+    $lblDest.Text = 'Dossier de travail (doit rester dans ton dossier utilisateur) :'
     $lblDest.Location = New-Object System.Drawing.Point(15, 404)
     $lblDest.Size = New-Object System.Drawing.Size(575, 20)
     $form.Controls.Add($lblDest)
@@ -544,7 +544,7 @@ function Show-ManageDialog {
     param([object]$Config)
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = "$script:AppName - gestion"
+    $form.Text = "$script:AppName - Gestion"
     $form.Size = New-Object System.Drawing.Size(540, 420)
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
@@ -552,9 +552,9 @@ function Show-ManageDialog {
     $lbl = New-Object System.Windows.Forms.Label
     $count = @($Config.sources).Count
     $lbl.Text = "Cowork Bridge est actif." + [Environment]::NewLine +
-                "Dossier de travail local : $($Config.dest)" + [Environment]::NewLine +
-                "Dossiers synchronisés : $count" + [Environment]::NewLine + [Environment]::NewLine +
-                "À connecter dans Cowork (et surtout PAS le dossier Google Drive) :" + [Environment]::NewLine +
+                "Dossier de travail : $($Config.dest)" + [Environment]::NewLine +
+                "Dossiers suivis : $count" + [Environment]::NewLine + [Environment]::NewLine +
+                "À connecter dans Cowork (et surtout pas le dossier Google Drive) :" + [Environment]::NewLine +
                 "$($Config.dest)"
     $lbl.Location = New-Object System.Drawing.Point(20, 18)
     $lbl.Size = New-Object System.Drawing.Size(490, 110)
@@ -625,10 +625,10 @@ function Start-Bridge {
     # 1. FreeFileSync present ?
     $ffs = Find-FreeFileSync
     if (-not $ffs) {
-        $m = "Il manque un petit logiciel gratuit (FreeFileSync) dont Cowork Bridge a besoin" + [Environment]::NewLine +
-             "pour copier tes fichiers. Il n'est pas encore installé sur cet ordinateur." + [Environment]::NewLine + [Environment]::NewLine +
+        $m = "Cowork Bridge a besoin d'un logiciel gratuit, FreeFileSync, pour copier tes fichiers." + [Environment]::NewLine +
+             "Il n'est pas encore installé sur cet ordinateur." + [Environment]::NewLine + [Environment]::NewLine +
              "Ouvrir la page de téléchargement maintenant ?" + [Environment]::NewLine +
-             "(installe-le — c'est gratuit — puis relance ce programme)"
+             "Installe FreeFileSync, puis rouvre Cowork Bridge."
         if (Confirm-YesNo $m) { Start-Process 'https://freefilesync.org/download.php' }
         return
     }
@@ -650,9 +650,10 @@ function Start-Bridge {
     $sources = Get-DriveSources
     if (-not $sources -or $sources.Count -eq 0) {
         $m = "Aucun dossier Google Drive détecté sur cet ordinateur." + [Environment]::NewLine + [Environment]::NewLine +
-             "Vérifie que Google Drive pour ordinateur est lancé et connecté, puis en mode" + [Environment]::NewLine +
-             "« Diffuser les fichiers » (Google Drive → Préférences → Diffuser les fichiers)." + [Environment]::NewLine +
-             "Relance ensuite ce programme."
+             "Vérifie que Google Drive pour ordinateur est lancé, que tu y es connecté à ton" + [Environment]::NewLine +
+             "compte, et qu'il est réglé sur « Accéder en ligne aux fichiers » (Paramètres →" + [Environment]::NewLine +
+             "Préférences → Dossiers de Drive → Options de synchronisation de Mon Drive)." + [Environment]::NewLine + [Environment]::NewLine +
+             "Relance ensuite Cowork Bridge."
         Show-Warn $m
         return
     }
@@ -667,18 +668,18 @@ function Start-Bridge {
                       "Pour en suivre un nouveau, crée-le d'abord dans Google Drive, puis reviens ici.")
             return
         }
-        $choice = Show-SelectionDialog -Sources $untracked -PreChecked $null -Dest $existing.dest -Interval ([int]$existing.interval) -Title 'ajouter un dossier' -OkLabel 'Ajouter'
+        $choice = Show-SelectionDialog -Sources $untracked -PreChecked $null -Dest $existing.dest -Interval ([int]$existing.interval) -Title 'Ajouter un dossier' -OkLabel 'Ajouter'
         if (-not $choice) { return }
         # union avec les dossiers déjà suivis ; dossier de travail inchangé, aucun retrait.
         $choice.Selected = @($existing.sources) + @($choice.Selected)
         $choice.Dest = $existing.dest
     }
     elseif ($mode -eq 'edit') {
-        $choice = Show-SelectionDialog -Sources $sources -PreChecked $existing.sources -Dest $existing.dest -Interval ([int]$existing.interval) -Title 'modifier la sélection' -OkLabel 'Enregistrer'
+        $choice = Show-SelectionDialog -Sources $sources -PreChecked $existing.sources -Dest $existing.dest -Interval ([int]$existing.interval) -Title 'Modifier la sélection' -OkLabel 'Enregistrer'
         if (-not $choice) { return }
     }
     else {
-        $choice = Show-SelectionDialog -Sources $sources -PreChecked $null -Dest $script:DefaultDest -Interval $script:DefaultInterval -Title 'installation' -OkLabel 'Installer'
+        $choice = Show-SelectionDialog -Sources $sources -PreChecked $null -Dest $script:DefaultDest -Interval $script:DefaultInterval -Title 'Installation' -OkLabel 'Installer'
         if (-not $choice) { return }
     }
 
@@ -689,10 +690,10 @@ function Start-Bridge {
         $removed = @($existing.sources | Where-Object { $newPaths -notcontains $_.Path })
         if ($removed.Count -gt 0) {
             $m = "Tu as retiré $($removed.Count) dossier(s) de la sélection." + [Environment]::NewLine + [Environment]::NewLine +
-                 "Leur contenu local va d'abord être sauvegardé vers Google Drive, puis la copie" + [Environment]::NewLine +
-                 "locale sera envoyée à la corbeille pour libérer de l'espace. Aucun fichier n'est" + [Environment]::NewLine +
-                 "perdu : rien n'est supprimé côté Drive, et la suppression locale est récupérable." + [Environment]::NewLine + [Environment]::NewLine +
-                 "Sauvegarder puis libérer l'espace ?"
+                 "Leur contenu va d'abord être renvoyé vers Google Drive, puis la copie locale" + [Environment]::NewLine +
+                 "sera envoyée à la corbeille pour libérer de l'espace. Aucun fichier n'est perdu :" + [Environment]::NewLine +
+                 "rien n'est supprimé côté Drive, et la suppression locale est récupérable." + [Environment]::NewLine + [Environment]::NewLine +
+                 "Renvoyer vers Drive puis libérer l'espace ?"
             if (Confirm-YesNo $m) {
                 $script:LogFile = Join-Path (Get-MetaDir $existing.dest) 'bridge.log'
 
@@ -757,21 +758,21 @@ function Start-Bridge {
 
         $auto = if ($res.Rts -and $res.Task) {
             "La synchronisation tourne maintenant toute seule en arrière-plan :" + [Environment]::NewLine +
-            "  - tes modifications partent vers Google Drive en temps réel ;" + [Environment]::NewLine +
-            "  - les changements venant de Drive reviennent ici toutes les $($choice.Interval) min."
+            "  - tes modifications sont renvoyées vers Google Drive en temps réel ;" + [Environment]::NewLine +
+            "  - les changements venant de Drive sont récupérés dans ton dossier de travail toutes les $($choice.Interval) min."
         } else {
-            "Remarque : la synchronisation automatique n'a pas pu être entièrement" + [Environment]::NewLine +
-            "configurée. Vois le guide (section Dépannage)."
+            "La synchronisation automatique n'a pas pu être entièrement configurée." + [Environment]::NewLine +
+            "Reporte-toi au guide (dépannage, « Synchro en temps réel absente »)."
         }
 
         $msg = "Installation terminée." + [Environment]::NewLine + [Environment]::NewLine +
-               "➡ DERNIÈRE ÉTAPE, dans Claude Cowork :" + [Environment]::NewLine +
-               "   connecte CE dossier (et surtout PAS ton dossier Google Drive) :" + [Environment]::NewLine + [Environment]::NewLine +
+               "Dernière étape, dans Claude Cowork : connecte le dossier ci-dessous —" + [Environment]::NewLine +
+               "et surtout pas ton dossier Google Drive :" + [Environment]::NewLine + [Environment]::NewLine +
                "   $($choice.Dest)" + [Environment]::NewLine + [Environment]::NewLine +
-               "   (Si Cowork affiche un dossier vide, c'est presque toujours qu'on a" + [Environment]::NewLine +
-               "    connecté le dossier Google Drive au lieu de celui-ci.)" + [Environment]::NewLine + [Environment]::NewLine +
+               "Si Cowork affiche un dossier vide, c'est presque toujours qu'on a connecté" + [Environment]::NewLine +
+               "le dossier Google Drive au lieu de celui-ci." + [Environment]::NewLine + [Environment]::NewLine +
                $auto + [Environment]::NewLine + [Environment]::NewLine +
-               "Espace utilisé en local ≈ la taille des dossiers cochés (tout reste aussi dans Drive)." + [Environment]::NewLine + [Environment]::NewLine +
+               "Espace utilisé sur le PC ≈ la taille des dossiers cochés (tout reste aussi dans Drive)." + [Environment]::NewLine + [Environment]::NewLine +
                (Get-SyncResultText ([int]$res.ExitCode))
         Show-Info $msg
     } catch {
