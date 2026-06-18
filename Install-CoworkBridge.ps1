@@ -93,18 +93,24 @@ function Remove-ToRecycleBin([string]$Path) {
 # Mise a jour : compare la version installee a la derniere Release publique,
 # telecharge l'installeur, verifie son SHA256, le lance (Inno met a jour en place).
 # ----------------------------------------------------------------------------
+# Renvoie $null si pas de fichier VERSION (copie non installée : dev, zip, .ps1 brut)
+# -> l'auto-check ne harcèle alors pas, seul l'exemplaire installé se met à jour.
 function Get-InstalledVersion {
     $f = Join-Path $PSScriptRoot 'VERSION'
     if (Test-Path $f) {
-        try { return [version]((Get-Content $f -Raw).Trim()) } catch {}
+        try {
+            $t = (Get-Content $f -Raw)
+            if ($t) { $t = $t.Trim() }
+            if ($t) { return [version]$t }
+        } catch {}
     }
-    return [version]'0.0.0.0'
+    return $null
 }
 
 function Get-LatestRelease {
     try {
         $h = @{ 'User-Agent' = 'CoworkBridge'; 'Accept' = 'application/vnd.github+json' }
-        $r = Invoke-RestMethod -Uri "https://api.github.com/repos/$script:Repo/releases/latest" -Headers $h -TimeoutSec 15
+        $r = Invoke-RestMethod -Uri "https://api.github.com/repos/$script:Repo/releases/latest" -Headers $h -TimeoutSec 6
         $tag = "$($r.tag_name)" -replace '^v', ''
         $ver = $null; try { $ver = [version]$tag } catch {}
         $exe = $r.assets | Where-Object { $_.name -like '*.exe' } | Select-Object -First 1
@@ -118,6 +124,12 @@ function Get-LatestRelease {
 function Invoke-UpdateCheck {
     param([switch]$Interactive)   # Interactive = message meme si a jour / hors ligne
     $installed = Get-InstalledVersion
+    if (-not $installed) {
+        # Pas de fichier VERSION = copie non installée : on ne propose rien en auto
+        # (sinon nag à chaque lancement, et on installerait par-dessus une copie brute).
+        if ($Interactive) { Show-Info("Version installée inconnue (cette copie n'a pas été posée par l'installeur). Récupère la dernière version sur la page des releases.") }
+        return $false
+    }
     $latest = Get-LatestRelease
     if (-not $latest) {
         if ($Interactive) { Show-Warn("Impossible de vérifier les mises à jour (pas de connexion, ou aucune version publiée).") }
@@ -132,20 +144,25 @@ function Invoke-UpdateCheck {
          "L'installer maintenant ? Tes dossiers suivis et tes réglages sont conservés."
     if (-not (Confirm-YesNo $m)) { return $false }
     try {
+        # Le checksum est le SEUL contrôle d'intégrité (pas de signature) : fail-closed.
+        # Pas de checksum publié, ou qui ne correspond pas -> on refuse de lancer l'exe.
+        if (-not $latest.SumUrl) {
+            Show-Warn("Mise à jour annulée : aucun checksum publié pour vérifier le téléchargement (sécurité).")
+            return $false
+        }
         $tmp = Join-Path $env:TEMP "CoworkBridge-Setup-$($latest.Tag).exe"
         Invoke-WebRequest -Uri $latest.ExeUrl -OutFile $tmp -UseBasicParsing -TimeoutSec 300
-        if ($latest.SumUrl) {
-            $sumTxt   = (Invoke-WebRequest -Uri $latest.SumUrl -UseBasicParsing -TimeoutSec 60).Content
-            $expected = (($sumTxt -split '\s+') | Select-Object -First 1).ToLower()
-            $actual   = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
-            if ($expected -and $expected -ne $actual) {
-                Show-Warn("Mise à jour annulée : le fichier téléchargé ne correspond pas au checksum attendu (sécurité).")
-                Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-                return $false
-            }
+        $sumTxt   = (Invoke-WebRequest -Uri $latest.SumUrl -UseBasicParsing -TimeoutSec 60).Content
+        $expected = (($sumTxt -split '\s+') | Where-Object { $_ } | Select-Object -First 1)
+        if ($expected) { $expected = $expected.ToLower() }
+        $actual   = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
+        if (-not $expected -or $expected -ne $actual) {
+            Show-Warn("Mise à jour annulée : le téléchargement ne correspond pas au checksum attendu (sécurité).")
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+            return $false
         }
-        # intégrité déjà vérifiée (checksum) + source HTTPS du dépôt : on retire le
-        # marquage "téléchargé d'internet" pour éviter un avertissement superflu.
+        # intégrité vérifiée + source HTTPS du dépôt : on retire le marquage
+        # "téléchargé d'internet" pour éviter un avertissement superflu.
         Unblock-File $tmp -ErrorAction SilentlyContinue
         Start-Process -FilePath $tmp
         return $true   # l'installeur prend le relais ; on quitte

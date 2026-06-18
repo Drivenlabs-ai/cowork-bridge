@@ -25,9 +25,12 @@ jobs:
       - name: Determine version (date-based)
         id: ver
         shell: bash
+        env:
+          TZ: UTC   # date ET git log --since dans le même fuseau, déterministe
         run: |
           DATE=$(date +%Y-%m-%d)
           COUNT=$(git log --oneline --since="$DATE 00:00:00" | wc -l | tr -d ' ')
+          if [ "$COUNT" -lt 1 ]; then COUNT=1; fi   # au moins 1 (le build courant)
           Y=$((10#$(date +%Y))); M=$((10#$(date +%m))); D=$((10#$(date +%d)))
           V="$Y.$M.$D.$COUNT"
           printf '%s' "$V" > VERSION
@@ -55,12 +58,19 @@ jobs:
           "$h  CoworkBridge-Setup.exe" | Out-File -FilePath Output\CHECKSUM -Encoding ascii -NoNewline
           Write-Host "SHA256: $h"
 
-      - name: Create release
+      - name: Create or update release
         shell: pwsh
         run: |
-          gh release create "v${{ steps.ver.outputs.version }}" `
-            "Output\CoworkBridge-Setup.exe" "Output\CHECKSUM" "VERSION" `
+          $tag = "v${{ steps.ver.outputs.version }}"
+          # Idempotent : si le tag existe déjà (re-run / push sans nouveau commit),
+          # on met à jour les assets au lieu d'échouer.
+          gh release create $tag "Output\CoworkBridge-Setup.exe" "Output\CHECKSUM" "VERSION" `
             --title "Cowork Bridge ${{ steps.ver.outputs.version }}" `
             --notes "Build automatique depuis ${{ github.sha }}"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Le tag $tag existe déjà -> mise à jour des assets (--clobber)."
+            gh release upload $tag "Output\CoworkBridge-Setup.exe" "Output\CHECKSUM" "VERSION" --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Échec publication de la release" }
+          }
         env:
           GH_TOKEN: ${{ github.token }}
