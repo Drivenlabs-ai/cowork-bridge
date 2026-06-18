@@ -41,6 +41,10 @@ Rien à faire, la synchronisation tourne en arrière-plan :
 
 Pour forcer une synchronisation immédiate : ouvre **Cowork Bridge** (icône du bureau, ou menu Démarrer → **Configurer Cowork Bridge**) → **Synchroniser maintenant**.
 
+## Mises à jour
+
+Cowork Bridge se met à jour tout seul : au lancement, s'il existe une version plus récente, il te propose de l'installer (tes dossiers suivis et réglages sont conservés). Tu peux aussi cliquer **« Vérifier les mises à jour »** dans la fenêtre de gestion.
+
 ## Ajouter ou retirer un dossier
 
 Ouvre **Cowork Bridge** (icône du bureau, ou menu Démarrer → **Configurer Cowork Bridge**) :

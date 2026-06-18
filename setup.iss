@@ -71,6 +71,9 @@ Name: "desktopicon"; Description: "Créer une icône sur le bureau"; GroupDescri
 Source: "Install-CoworkBridge.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Run-CoworkBridge.bat";     DestDir: "{app}"; Flags: ignoreversion
 Source: "GUIDE.md";                 DestDir: "{app}"; Flags: ignoreversion isreadme
+; VERSION : écrit par la CI (date-version) ; permet à l'app de connaître sa
+; version installée pour la vérif de mise à jour. Absent en build local -> ignoré.
+Source: "VERSION";                  DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; Source: "assets\app.ico";         DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

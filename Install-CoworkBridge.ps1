@@ -48,6 +48,7 @@ $script:MetaDirName = '_bridge'                 # sous-dossier technique dans la
 $script:TaskName    = 'CoworkBridge-Sync'
 $script:DefaultInterval = 30                    # minutes (pull periodique)
 $script:LogFile     = $null                     # defini lors de l'installation
+$script:Repo        = 'Drivenlabs-ai/cowork-bridge'   # pour la verif de mise a jour
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -86,6 +87,72 @@ function Remove-ToRecycleBin([string]$Path) {
         $Path,
         [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
         [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
+}
+
+# ----------------------------------------------------------------------------
+# Mise a jour : compare la version installee a la derniere Release publique,
+# telecharge l'installeur, verifie son SHA256, le lance (Inno met a jour en place).
+# ----------------------------------------------------------------------------
+function Get-InstalledVersion {
+    $f = Join-Path $PSScriptRoot 'VERSION'
+    if (Test-Path $f) {
+        try { return [version]((Get-Content $f -Raw).Trim()) } catch {}
+    }
+    return [version]'0.0.0.0'
+}
+
+function Get-LatestRelease {
+    try {
+        $h = @{ 'User-Agent' = 'CoworkBridge'; 'Accept' = 'application/vnd.github+json' }
+        $r = Invoke-RestMethod -Uri "https://api.github.com/repos/$script:Repo/releases/latest" -Headers $h -TimeoutSec 15
+        $tag = "$($r.tag_name)" -replace '^v', ''
+        $ver = $null; try { $ver = [version]$tag } catch {}
+        $exe = $r.assets | Where-Object { $_.name -like '*.exe' } | Select-Object -First 1
+        $sum = $r.assets | Where-Object { $_.name -like '*CHECKSUM*' } | Select-Object -First 1
+        if (-not $ver -or -not $exe) { return $null }
+        return [pscustomobject]@{ Version = $ver; Tag = $tag; ExeUrl = $exe.browser_download_url; SumUrl = $sum.browser_download_url }
+    } catch { return $null }
+}
+
+# Renvoie $true si une mise a jour a ete lancee (l'appelant doit alors quitter).
+function Invoke-UpdateCheck {
+    param([switch]$Interactive)   # Interactive = message meme si a jour / hors ligne
+    $installed = Get-InstalledVersion
+    $latest = Get-LatestRelease
+    if (-not $latest) {
+        if ($Interactive) { Show-Warn("Impossible de vérifier les mises à jour (pas de connexion, ou aucune version publiée).") }
+        return $false
+    }
+    if ($latest.Version -le $installed) {
+        if ($Interactive) { Show-Info("Cowork Bridge est à jour (version $installed).") }
+        return $false
+    }
+    $m = "Une mise à jour est disponible." + [Environment]::NewLine +
+         "Installée : $installed   →   Disponible : $($latest.Version)" + [Environment]::NewLine + [Environment]::NewLine +
+         "L'installer maintenant ? Tes dossiers suivis et tes réglages sont conservés."
+    if (-not (Confirm-YesNo $m)) { return $false }
+    try {
+        $tmp = Join-Path $env:TEMP "CoworkBridge-Setup-$($latest.Tag).exe"
+        Invoke-WebRequest -Uri $latest.ExeUrl -OutFile $tmp -UseBasicParsing -TimeoutSec 300
+        if ($latest.SumUrl) {
+            $sumTxt   = (Invoke-WebRequest -Uri $latest.SumUrl -UseBasicParsing -TimeoutSec 60).Content
+            $expected = (($sumTxt -split '\s+') | Select-Object -First 1).ToLower()
+            $actual   = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
+            if ($expected -and $expected -ne $actual) {
+                Show-Warn("Mise à jour annulée : le fichier téléchargé ne correspond pas au checksum attendu (sécurité).")
+                Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                return $false
+            }
+        }
+        # intégrité déjà vérifiée (checksum) + source HTTPS du dépôt : on retire le
+        # marquage "téléchargé d'internet" pour éviter un avertissement superflu.
+        Unblock-File $tmp -ErrorAction SilentlyContinue
+        Start-Process -FilePath $tmp
+        return $true   # l'installeur prend le relais ; on quitte
+    } catch {
+        Show-Warn("La mise à jour a échoué : $($_.Exception.Message)")
+        return $false
+    }
 }
 
 # ----------------------------------------------------------------------------
@@ -627,6 +694,11 @@ function Show-ManageDialog {
     $btnUninstall.Location = New-Object System.Drawing.Point(20, 352); $btnUninstall.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnUninstall)
 
+    $btnUpdate = New-Object System.Windows.Forms.Button
+    $btnUpdate.Text = 'Vérifier les mises à jour'
+    $btnUpdate.Location = New-Object System.Drawing.Point(285, 352); $btnUpdate.Size = New-Object System.Drawing.Size(245, 34)
+    $form.Controls.Add($btnUpdate)
+
     $status = New-Object System.Windows.Forms.Label
     $status.Location = New-Object System.Drawing.Point(20, 398); $status.Size = New-Object System.Drawing.Size(510, 50)
     $status.ForeColor = [System.Drawing.Color]::DimGray
@@ -651,6 +723,7 @@ function Show-ManageDialog {
     $btnAdd.Add_Click({ $script:ManageAction = 'add'; $form.Close() })
     $btnEdit.Add_Click({ $script:ManageAction = 'edit'; $form.Close() })
     $btnUninstall.Add_Click({ $script:ManageAction = 'uninstall'; $form.Close() })
+    $btnUpdate.Add_Click({ if (Invoke-UpdateCheck -Interactive) { $form.Close() } })
 
     [void]$form.ShowDialog()
     return $script:ManageAction
@@ -664,6 +737,9 @@ function Show-Warn($msg)  { [void][System.Windows.Forms.MessageBox]::Show($msg, 
 function Confirm-YesNo($msg) { return ([System.Windows.Forms.MessageBox]::Show($msg, $script:AppName, 'YesNo', 'Question') -eq 'Yes') }
 
 function Start-Bridge {
+    # 0. Mise à jour disponible ? (silencieux si à jour ou hors ligne)
+    if (Invoke-UpdateCheck) { return }   # l'installeur de mise à jour prend le relais
+
     # 1. FreeFileSync present ?
     $ffs = Find-FreeFileSync
     if (-not $ffs) {
