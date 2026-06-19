@@ -76,6 +76,24 @@ function Remove-ToRecycleBin([string]$Path) {
         [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
 }
 
+# Confinement : un chemin (rechargé depuis config) doit rester sous le home.
+# Re-vérifié à chaque opération destructive/création (pas seulement à l'install).
+function Test-UnderHome([string]$Path) {
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $home = [System.IO.Path]::GetFullPath($script:HomeRoot).TrimEnd('\')
+        return $full.Equals($home, [System.StringComparison]::OrdinalIgnoreCase) -or
+               $full.StartsWith($home + '\', [System.StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+# Rejette un chemin contenant un caractère qui n'a rien à faire dans un chemin
+# Windows (CR/LF, guillemet) -> bloque toute injection dans les configs/scripts générés.
+function Assert-SafePath([string]$Path) {
+    if ($null -eq $Path) { return }
+    if ($Path -match '[\r\n"]') { throw "Chemin invalide (caractère interdit) : $Path" }
+}
+
 # ----------------------------------------------------------------------------
 # Espace disque (garde-fou : ne jamais remplir le profil -> session bloquée)
 # ----------------------------------------------------------------------------
@@ -136,8 +154,8 @@ function Get-LatestRelease {
         $r = Invoke-RestMethod -Uri "https://api.github.com/repos/$script:Repo/releases/latest" -Headers $h -TimeoutSec 6
         $tag = "$($r.tag_name)" -replace '^v', ''
         $ver = $null; try { $ver = [version]$tag } catch {}
-        $exe = $r.assets | Where-Object { $_.name -like '*.exe' } | Select-Object -First 1
-        $sum = $r.assets | Where-Object { $_.name -like '*CHECKSUM*' } | Select-Object -First 1
+        $exe = $r.assets | Where-Object { $_.name -eq 'CoworkBridge-Setup.exe' } | Select-Object -First 1
+        $sum = $r.assets | Where-Object { $_.name -eq 'CHECKSUM' } | Select-Object -First 1
         if (-not $ver -or -not $exe) { return $null }
         return [pscustomobject]@{ Version = $ver; Tag = $tag; ExeUrl = $exe.browser_download_url; SumUrl = $sum.browser_download_url }
     } catch { return $null }
@@ -179,7 +197,8 @@ function Invoke-UpdateCheck {
             Remove-Item $tmp -Force -ErrorAction SilentlyContinue
             return $false
         }
-        Unblock-File $tmp -ErrorAction SilentlyContinue
+        # On NE retire PAS le mark-of-the-web : tant que l'exe n'est pas signé, on laisse
+        # SmartScreen évaluer le binaire téléchargé (dernier filet côté utilisateur).
         Start-Process -FilePath $tmp
         return $true
     } catch {
@@ -245,6 +264,7 @@ function ConvertTo-XmlSafe([string]$s) {
     $s = $s -replace '<', '&lt;'
     $s = $s -replace '>', '&gt;'
     $s = $s -replace '"', '&quot;'
+    $s = $s -replace "'", '&apos;'   # correct dans tout contexte XML (y compris attribut simple-quote)
     return $s
 }
 
@@ -257,6 +277,7 @@ function New-FfsBatch {
         [string]$OutPath,
         [ValidateSet('TwoWay','Mirror','Update')][string]$Variant = 'TwoWay'
     )
+    foreach ($p in $Pairs) { Assert-SafePath $p.Left; Assert-SafePath $p.Right }
     $pairBlocks = foreach ($p in $Pairs) {
 @"
         <Pair>
@@ -315,6 +336,8 @@ $pairsXml
 
 function New-FfsReal {
     param([string[]]$WatchDirs, [string]$FfsExe, [string]$BatchPath, [string]$OutPath)
+    Assert-SafePath $FfsExe; Assert-SafePath $BatchPath
+    foreach ($d in $WatchDirs) { Assert-SafePath $d }
     $items = foreach ($d in $WatchDirs) { "    <Item>$(ConvertTo-XmlSafe $d)</Item>" }
     $itemsXml = ($items -join "`r`n")
     $cmd = ConvertTo-XmlSafe ('"{0}" "{1}"' -f $FfsExe, $BatchPath)
@@ -362,6 +385,8 @@ function Set-IntervalFile([string]$MetaDir, [int]$IntervalMin) {
 function Set-SyncLoop {
     param([string]$FfsExe, [string]$BatchPath, [string]$MetaDir, [int]$IntervalMin)
     try {
+        # un CR/LF dans un de ces chemins romprait le littéral PS et injecterait du code
+        Assert-SafePath $FfsExe; Assert-SafePath $BatchPath; Assert-SafePath $MetaDir
         Set-IntervalFile -MetaDir $MetaDir -IntervalMin $IntervalMin
         $ffsLit  = $FfsExe.Replace("'", "''")
         $batLit  = $BatchPath.Replace("'", "''")
@@ -438,8 +463,9 @@ function Build-Pairs { param([object[]]$Selected, [string]$Dest)
         $persisted = $null
         if (($s.PSObject.Properties.Name -contains 'LocalName') -and $s.LocalName) { $persisted = [string]$s.LocalName }
         if ($persisted) {
-            # honorer le nom local déjà sur disque (n'invente pas un nouveau dossier)
-            $localName = $persisted
+            # honorer le nom local déjà sur disque (n'invente pas un nouveau dossier),
+            # mais toujours assaini (anti-traversal si la config a été altérée)
+            $localName = ($persisted -replace '[\\/:*?"<>|]', '_')
             [void]$used.Add($localName.ToLowerInvariant())
         } else {
             $prefix = if ($s.Type -eq 'Shared') { 'Partage - ' } else { '' }
@@ -455,10 +481,17 @@ function Build-Pairs { param([object[]]$Selected, [string]$Dest)
 }
 
 # Nom local d'une source enregistrée (LocalName persisté, sinon recalcul).
+# Toujours assaini : sans séparateur ni caractère réservé -> ne peut pas remonter
+# hors du dossier de travail, même si la config a été altérée.
 function Resolve-LocalName([object]$Source) {
-    if (($Source.PSObject.Properties.Name -contains 'LocalName') -and $Source.LocalName) { return $Source.LocalName }
-    $prefix = if ($Source.Type -eq 'Shared') { 'Partage - ' } else { '' }
-    return (($prefix + $Source.Name) -replace '[\\/:*?"<>|]', '_')
+    $raw = $null
+    if (($Source.PSObject.Properties.Name -contains 'LocalName') -and $Source.LocalName) {
+        $raw = [string]$Source.LocalName
+    } else {
+        $prefix = if ($Source.Type -eq 'Shared') { 'Partage - ' } else { '' }
+        $raw = $prefix + [string]$Source.Name
+    }
+    return ($raw -replace '[\\/:*?"<>|]', '_')
 }
 
 function Get-SortedSources([object]$Config) {
@@ -479,6 +512,7 @@ function Apply-Config {
         [object]$Ffs, [bool]$FirstRun, [scriptblock]$Status
     )
     $say = { param($m) if ($Status) { & $Status $m } }
+    if (-not (Test-UnderHome $Dest)) { throw "Dossier de travail hors du dossier utilisateur : $Dest" }
     & $say 'Préparation des dossiers...'
     if (-not (Test-Path $Dest)) { New-Item -ItemType Directory -Path $Dest -Force | Out-Null }
     $meta = Get-MetaDir $Dest
@@ -540,6 +574,10 @@ function Apply-Config {
 # suppression), puis envoie la copie locale à la corbeille, puis régénère.
 function Remove-TrackedFolder {
     param([object]$Config, [object]$Source, [object]$Ffs)
+    if (-not (Test-UnderHome $Config.dest)) {
+        Show-Warn("Dossier de travail hors de ton dossier utilisateur — opération annulée par sécurité.")
+        return $false
+    }
     $meta = Get-MetaDir $Config.dest
     $script:LogFile = Join-Path $meta 'bridge.log'
     $local = Join-Path $Config.dest (Resolve-LocalName $Source)
@@ -549,7 +587,8 @@ function Remove-TrackedFolder {
         New-FfsBatch -Pairs @([pscustomobject]@{ Left = $local; Right = $Source.Path }) -OutPath $pushBatch -Variant 'Update'
         $pushed = $false
         try {
-            $p = Start-Process -FilePath $Config.ffsExe -ArgumentList ('"{0}"' -f $pushBatch) -PassThru -Wait
+            # exe re-résolu (Find-FreeFileSync), jamais le chemin stocké en config
+            $p = Start-Process -FilePath $Ffs.Exe -ArgumentList ('"{0}"' -f $pushBatch) -PassThru -Wait
             $pushed = ([int]$p.ExitCode -le 1)
             Write-Log "Désync : remontée Update local->Drive de '$($Source.Name)', code $($p.ExitCode)"
         } catch { Write-Log "Désync : remontée échouée: $($_.Exception.Message)" 'WARN' }
@@ -896,7 +935,9 @@ function Show-ManageDialog {
     $btnSync.Add_Click({
         $busy.Invoke('Synchronisation en cours...')
         try {
-            $p = Start-Process -FilePath $script:mgConfig.ffsExe -ArgumentList ('"{0}"' -f $script:mgConfig.batch) -PassThru -Wait
+            # exe re-résolu + batch canonique (jamais les chemins stockés en config)
+            $batch = Join-Path (Get-MetaDir $script:mgConfig.dest) 'bridge.ffs_batch'
+            $p = Start-Process -FilePath $Ffs.Exe -ArgumentList ('"{0}"' -f $batch) -PassThru -Wait
             $busy.Invoke((Get-SyncResultText ([int]$p.ExitCode)))
         } catch { $busy.Invoke("La synchronisation n'a pas pu démarrer : $($_.Exception.Message)") }
     })
