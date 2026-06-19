@@ -16,8 +16,8 @@ cloud <->[Google Drive Desktop, mode STREAM]<-> Mon Drive\X <->[FreeFileSync]<->
 
 - **Mode Stream, pas Miroir** : tout le Drive reste en placeholders (≈0 octet) ; seuls les dossiers pontés sont hydratés. Le bridge ne fait donc pas exploser le stockage, il le réduit vs Miroir.
 - **FreeFileSync** comme moteur : two-way + gestion de conflits + cross-platform (un seul outil pour un parc Win/Mac). Suppressions → corbeille.
-- **Ciblage** : l'UI laisse cocher dossiers de *Mon Drive* + *Drive partagés*. Stockage local ≈ Σ(dossiers cochés).
-- Synchro de fond : **RealTimeSync** (démarrage, push temps réel des modifs locales) + **tâche planifiée** (pull périodique du Drive, 30 min par défaut — les notifs de changement côté Drive virtuel ne sont pas fiables, d'où le polling).
+- **Ciblage** : on ajoute les dossiers **par l'explorateur** (`Select-DriveFolder`, OpenFileDialog détourné — barre d'adresse + navigation), pas par une liste auto-détectée. Avant chaque ajout : **garde-fou disque** (`Test-DiskBudget` / `New-BrowsedSource`) — refuse si le dossier ne tient pas sur C: avec une marge (`$DiskMarginBytes` ≈ 5 Go). **Critique** : un disque plein empêche Windows de charger le profil → session temporaire vierge (incident observé chez Dylan). Stockage local ≈ Σ(dossiers suivis).
+- Synchro de fond : **RealTimeSync** (démarrage, push instantané + pull à chaque modif locale) + **boucle résidente unique** (`Set-SyncLoop` → `_bridge\sync-loop.ps1`, dossier Démarrage, sans droits) pour le **pull périodique** : relit l'intervalle (`_bridge\interval`) à chaque tour (délai **modifiable à chaud**), écrit l'heure de prochaine synchro (`_bridge\next-sync`, source du **minuteur**), **verrou mono-instance** (ne lance pas FFS si une instance tourne → anti-chevauchement RTS). La tâche planifiée n'est plus le mécanisme (seulement `Unregister-SyncTask` au nettoyage) : elle échouait sur PC verrouillé (« Accès refusé ») et compliquait délai-live + minuteur.
 - **Sûreté des données** (post-revue) : la 1ʳᵉ synchro d'une nouvelle install est en **Miroir Drive → local** (`Variant=Mirror`, ne touche jamais le côté Drive) ; la synchro courante seulement est `TwoWay`. Suppressions = `DeletionPolicy=RecycleBin`. La libération d'une copie locale (déselect) passe par la **corbeille** (`Microsoft.VisualBasic.FileIO`) et **uniquement si la dernière synchro a réussi** (exit ≤ 1). Garde anti-collision sur les noms de dossiers locaux.
 
 Alternative évaluée et reportée en v2 : **rclone direct** (API Drive, sans Drive Desktop) → stockage ×1 exact, shared drives natifs, mais nécessite une app Google OAuth Drivenlabs (setup + vérification Google). Voir la conversation d'origine.
@@ -25,13 +25,13 @@ Alternative évaluée et reportée en v2 : **rclone direct** (API Drive, sans Dr
 ## Fichiers
 
 - `Run-CoworkBridge.bat` — lanceur (PowerShell `-STA -ExecutionPolicy Bypass`).
-- `Install-CoworkBridge.ps1` — installeur WinForms (PS 5.1, pas de ternaire/PS7). Détecte le montage Drive, sélection des dossiers, génère les configs FFS, installe l'autostart + tâche, première synchro. Mode gestion si install existante (synchro, modifier sélection, désinstaller). **⚠ Doit rester encodé UTF-8 AVEC BOM** : PS 5.1 lit un `.ps1` sans BOM en codepage ANSI et casse tous les accents des chaînes UI. Après toute réédition avec un outil qui retire le BOM, le réajouter (`printf '\xEF\xBB\xBF'` en tête). Identifiants de code en anglais, chaînes UI en français accentué.
+- `Install-CoworkBridge.ps1` — installeur + **centre de contrôle** WinForms (PS 5.1, pas de PS7). Install : choix des dossiers **par l'explorateur** + garde disque → `Apply-Config` (configs FFS, RTS + boucle, 1ʳᵉ synchro Miroir). Si install existante → **panneau de gestion** : liste des dossiers suivis, **Ajouter** (explorateur), **Désynchroniser** par dossier (`Remove-TrackedFolder` : remontée Update local→Drive puis corbeille), **délai applicable à chaud** (Appliquer → écrit `_bridge\interval`), **minuteur** (Timer lit `_bridge\next-sync`), Synchroniser, Ouvrir, MAJ, Désinstaller. `Apply-Config` est factorisé (install / ajout / désync). **⚠ Doit rester encodé UTF-8 AVEC BOM** : PS 5.1 lit un `.ps1` sans BOM en codepage ANSI et casse tous les accents des chaînes UI. Après toute réédition avec un outil qui retire le BOM, le réajouter (`printf '\xEF\xBB\xBF'` en tête). Identifiants de code en anglais, chaînes UI en français accentué.
 - `GUIDE.md` — guide client + checklist de déploiement Drivenlabs.
 - `setup.iss` — script Inno Setup → installeur Windows pro (per-user, sans admin ; menu Démarrer, désinstalleur, lance la config au « Terminé »). Compilé sur Windows (CI ou machine Windows), pas sur Mac.
 - `.github/workflows/build.yml` — CI : runner Windows compile l'installeur, signe si secrets présents, publie l'artefact (et une Release sur tag `v*`).
 - `.gitignore` — ignore `Output/`, `*.exe`, `*.pfx`.
 
-État runtime chez le client : `%USERPROFILE%\CoworkWork\_bridge\` (`config.json`, `bridge.ffs_batch`, `bridge.ffs_real`, `bridge.log`).
+État runtime chez le client : `%USERPROFILE%\CoworkWork\_bridge\` (`config.json`, `bridge.ffs_batch`, `bridge.ffs_real`, `sync-loop.ps1`, `interval`, `next-sync`, `bridge.log`).
 
 ## Build & distribution (pro)
 
@@ -61,7 +61,7 @@ Limites connues :
 
 ## Détails techniques vérifiés
 
-- `.ffs_batch` : `XmlType="BATCH" XmlFormat="13"` (FFS convertit les anciens formats vers l'avant). `Synchronize/Variant` = `TwoWay` (courant) ou `Mirror` (1er run), `DeletionPolicy=RecycleBin`, `Batch/ProgressDialog Minimized+AutoClose`, `Errors Ignore="true"` (c'est CE flag qui rend la synchro non bloquante en tâche planifiée ; `ErrorDialog` reste à la valeur vérifiée `Show` pour ne pas risquer un enum invalide qui ferait rejeter tout le batch). `LogfileFolder MaxCount="0"` self-closing = forme **exacte** d'un vrai fichier format-13 (NE PAS mettre `Limit`, qui est le format 17). Lancement : `FreeFileSync.exe "x.ffs_batch"` (codes 0=ok / 1=warn / 2=err / 3=annulé).
+- `.ffs_batch` : `XmlType="BATCH" XmlFormat="13"` (FFS convertit les anciens formats vers l'avant). `Synchronize/Variant` = `TwoWay` (courant) ou `Mirror` (1er run), `DeletionPolicy=RecycleBin`, `Batch/ProgressDialog Minimized+AutoClose`, `Errors Ignore="true"` (c'est CE flag qui rend la synchro non bloquante en tâche planifiée ; `ErrorDialog` reste à la valeur vérifiée `Show` pour ne pas risquer un enum invalide qui ferait rejeter tout le batch). élément log = `<LogFolder/>` (vide = défaut) **à la racine**, PAS `<LogfileFolder>` ni dans `<Batch>` : schéma actuel vérifié dans la source FFS `config.cpp` (`XML_FORMAT_SYNC_CFG=23`, élément `LogFolder` lu à la racine) ; le `<Variant>` est migré par FFS depuis le format 13. C'était le bug « config incomplète / impossible de lire LogFolder » vu chez le client. Lancement : `FreeFileSync.exe "x.ffs_batch"` (codes 0=ok / 1=warn / 2=err / 3=annulé).
 - `.ffs_real` : `XmlType="REAL" XmlFormat="2"`, `Directories/Item`, `Delay`, `Commandline`. Lancé par `RealTimeSync.exe "x.ffs_real"`.
 - Détection Drive : scan des racines de lecteurs + home, recherche d'un enfant `My Drive`/`Mon Drive` et `Shared drives`/`Drive partages`.
 
@@ -71,9 +71,15 @@ Revue 1 (3 relecteurs : correction, sécurité, UX) et correctifs : 1er run en M
 
 Revue 2 (post-packaging, CI + régression PS) et correctifs : **B1** la désélection supprimait par nom recalculé sans suffixe anti-collision → on persiste `LocalName` en config et on supprime par nom stocké ; **M1** la synchro finale de désélection était TwoWay (pouvait propager une suppression vers Drive) → remplacée par un batch **Update local→Drive** (copie seule, jamais de suppression) ciblé sur les dossiers retirés, gardé sur exit code ; CI durcie : moindre privilège (`contents: read` global, `write` au seul job release), garde anti-release-non-signée sur tag, actions épinglées par SHA, Inno pinné 6.7.1, PFX en `try/finally`, `VersionInfoVersion` numérique dédié. `setup.iss` : tous les points Inno vérifiés corrects. Note connue : l'`[UninstallRun]` fait `Stop-Process RealTimeSync` global (tue toutes les instances RTS, pas seulement la nôtre — pas de PID tracking ; acceptable car les clients ne lancent pas d'autre RTS).
 
-⚠️ **v1 toujours non exécutée sur Windows** (développée sur macOS, pas de `pwsh` pour parser). À valider sur une vraie machine (Dylan) avant déploiement large, points à confirmer en priorité :
-1. le `.ffs_batch` généré est accepté par le FreeFileSync installé (format 17) — sinon, basculer sur la reco structurelle : templater un `.ffs_batch` sauvegardé depuis le FFS réel plutôt que hand-author ;
-2. enregistrement de la tâche planifiée + raccourci Démarrage ;
-3. détection du montage Drive (noms `My Drive`/`Shared drives` localisés) ;
-4. concurrence RealTimeSync ↔ tâche planifiée sur les mêmes paires (Delay RTS porté à 30 s, `MultipleInstances IgnoreNew` sur la tâche — à surveiller sur dossiers partagés).
+**Incident client (2026-06-19)** : après redémarrage, session vierge (profil temporaire Windows) — cause probable **disque C: saturé** par la synchro dans `CoworkWork` (sous le profil). D'où la Phase A : **garde-fou disque** + doc recovery (supprimer `CoworkWork`, reboot). Bug FFS `<LogFolder>` confirmé corrigé en parallèle (install + 1ʳᵉ synchro `code 0` chez le client).
+
+**Réécriture (rewrite control-center)** : boucle unifiée (intervalle live, `next-sync`, mono-instance), `Apply-Config` factorisé, garde disque (`Test-DiskBudget`), config par explorateur (plus de liste auto-détectée), panneau = centre de contrôle (liste suivis, ajouter, désync par dossier, délai applicable, minuteur), tâche planifiée abandonnée comme mécanisme.
+
+⚠️ **Non exécuté sur Windows** (dev macOS, pas de `pwsh` ; structure vérifiée — accolades/parenthèses/here-strings équilibrées, BOM, `$args` réservé évité). À valider chez Dylan, priorités :
+1. `.ffs_batch` accepté par le FFS installé (`<LogFolder>` racine — déjà validé `code 0` au dernier test) ;
+2. garde disque : ajouter un dossier > espace libre → doit refuser ; recovery (supprimer `CoworkWork` + reboot) restaure le profil ;
+3. boucle résidente : pull périodique effectif, **délai modifiable à chaud** pris en compte, **minuteur** qui décompte ;
+4. désync d'un dossier : remontée Drive OK puis corbeille, fichiers Drive intacts ;
+5. sélecteur explorateur (OpenFileDialog détourné) ergonomique ;
+6. scoping des scriptblocks WinForms (handlers + helpers `$busy`/`$statusCb` invoqués via `.Invoke()`/`&`).
 Cible PS 5.1 (défaut Windows).

@@ -1,37 +1,25 @@
 ﻿<#
-    Cowork Bridge - Installateur
-    -----------------------------
-    Pont entre un dossier Google Drive (mode Stream) et un dossier local plat
-    lisible par Claude Cowork.
+    Cowork Bridge - Installateur / centre de contrôle
+    --------------------------------------------------
+    Pont entre Google Drive (mode « Accéder en ligne aux fichiers ») et un dossier
+    local plat lisible par Claude Cowork. Le sandbox de Cowork ne traverse pas le
+    filesystem virtuel de Drive ; on lui donne donc de vrais octets dans
+    %USERPROFILE%\CoworkWork (dans le home, contrainte Cowork).
 
-    Pourquoi : le sandbox de Cowork (VM Hyper-V, montage virtiofs/Plan9) ne sait
-    pas traverser le filesystem virtuel de Google Drive. Il faut donc lui donner
-    de vrais octets sur un chemin NTFS classique, DANS le dossier home de
-    l'utilisateur (contrainte Cowork : aucun dossier hors du home n'est accepte,
-    et les raccourcis/jonctions sont resolus puis rejetes).
+    Synchro :
+      - RealTimeSync (démarrage) = push instantané des modifs locales.
+      - Boucle résidente (démarrage, _bridge\sync-loop.ps1) = pull périodique :
+        relit l'intervalle (_bridge\interval) à chaque tour, écrit l'heure de
+        prochaine synchro (_bridge\next-sync) pour le minuteur, et ne lance pas
+        FreeFileSync si une instance tourne déjà (verrou mono-instance).
+      - 1er run d'une nouvelle install = Miroir Drive -> local (jamais d'effacement
+        Drive). Suppressions = corbeille (récupérables).
 
-    Ce que fait l'installeur :
-      1. detecte le montage Google Drive (Mon Drive + Drive partages)
-      2. laisse choisir les dossiers a ponter (ciblage)
-      3. cree %USERPROFILE%\CoworkWork et un sous-dossier par source
-      4. genere une config FreeFileSync (.ffs_batch)
-      5. installe la synchro de fond (RealTimeSync au demarrage + tache planifiee)
-      6. lance une PREMIERE synchro en mode Miroir Drive -> local (jamais de
-         suppression cote Drive au 1er run), puis bascule en deux-sens ensuite.
+    Sécurité disque : avant d'ajouter un dossier, on vérifie qu'il tient sur C:
+    avec une marge (sinon remplir le profil empêche Windows de l'ouvrir).
 
-    Securite des donnees :
-      - 1er run = Miroir Drive -> local : impossible d'effacer cote Drive.
-      - synchro courante = deux-sens, suppressions vers la CORBEILLE (Windows
-        + corbeille Drive) = recuperables.
-      - liberation d'une copie locale = envoi a la corbeille, jamais en dur,
-        et seulement apres une derniere synchro reussie.
-
-    Moteur : FreeFileSync (a installer au prealable - cross-platform, deux-sens
-    avec gestion de conflits).
-
-    Lancer via Run-CoworkBridge.bat (gere ExecutionPolicy + mode STA).
-    Le script doit etre encode en UTF-8 AVEC BOM (sinon PowerShell 5.1 casse les
-    accents) ; Run-CoworkBridge.bat + le build s'en chargent.
+    Moteur : FreeFileSync (à installer au préalable).
+    Lancer via Run-CoworkBridge.bat (-STA -ExecutionPolicy Bypass). UTF-8 AVEC BOM.
 #>
 
 #requires -version 5.1
@@ -44,11 +32,12 @@ $ErrorActionPreference = 'Stop'
 $script:AppName     = 'Cowork Bridge'
 $script:HomeRoot    = $env:USERPROFILE
 $script:DefaultDest = Join-Path $script:HomeRoot 'CoworkWork'
-$script:MetaDirName = '_bridge'                 # sous-dossier technique dans la destination
-$script:TaskName    = 'CoworkBridge-Sync'
-$script:DefaultInterval = 30                    # minutes (pull periodique)
-$script:LogFile     = $null                     # defini lors de l'installation
-$script:Repo        = 'Drivenlabs-ai/cowork-bridge'   # pour la verif de mise a jour
+$script:MetaDirName = '_bridge'
+$script:TaskName    = 'CoworkBridge-Sync'        # ancien mécanisme : nettoyé seulement
+$script:DefaultInterval = 30
+$script:DiskMarginBytes = [long]5 * 1GB          # laisser au moins ça de libre sur C:
+$script:LogFile     = $null
+$script:Repo        = 'Drivenlabs-ai/cowork-bridge'
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -56,7 +45,7 @@ Add-Type -AssemblyName Microsoft.VisualBasic
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # ----------------------------------------------------------------------------
-# Log
+# Log + utilitaires
 # ----------------------------------------------------------------------------
 function Get-MetaDir([string]$dest) { Join-Path $dest $script:MetaDirName }
 
@@ -72,7 +61,6 @@ function Write-Log {
     } catch {}
 }
 
-# Traduit le code de sortie FreeFileSync en phrase claire pour un non-technicien.
 function Get-SyncResultText([int]$code) {
     switch ($code) {
         0       { 'Synchronisation terminée. Tout est à jour.' }
@@ -81,7 +69,6 @@ function Get-SyncResultText([int]$code) {
     }
 }
 
-# Suppression vers la corbeille (recuperable), jamais en dur.
 function Remove-ToRecycleBin([string]$Path) {
     [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
         $Path,
@@ -90,11 +77,47 @@ function Remove-ToRecycleBin([string]$Path) {
 }
 
 # ----------------------------------------------------------------------------
-# Mise a jour : compare la version installee a la derniere Release publique,
-# telecharge l'installeur, verifie son SHA256, le lance (Inno met a jour en place).
+# Espace disque (garde-fou : ne jamais remplir le profil -> session bloquée)
 # ----------------------------------------------------------------------------
-# Renvoie $null si pas de fichier VERSION (copie non installée : dev, zip, .ps1 brut)
-# -> l'auto-check ne harcèle alors pas, seul l'exemplaire installé se met à jour.
+function Get-FolderSizeBytes([string]$Path) {
+    try {
+        $m = Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue |
+             Measure-Object -Property Length -Sum
+        if ($m -and $m.Sum) { return [long]$m.Sum }
+    } catch {}
+    return [long]0
+}
+
+function Get-FreeBytes([string]$Path) {
+    try {
+        $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path))
+        return (New-Object System.IO.DriveInfo($root)).AvailableFreeSpace
+    } catch { return [long]-1 }   # -1 = inconnu (distinct d'un vrai disque plein à 0)
+}
+
+function Format-Size([long]$b) {
+    if ($b -ge 1GB) { return ('{0:N1} Go' -f ($b / 1GB)) }
+    if ($b -ge 1MB) { return ('{0:N0} Mo' -f ($b / 1MB)) }
+    return ('{0:N0} Ko' -f ($b / 1KB))
+}
+
+# Vrai si $NeededBytes tient sur le disque de $Dest en gardant la marge.
+function Test-DiskBudget([long]$NeededBytes, [string]$Dest) {
+    $free = Get-FreeBytes $Dest
+    # free < 0 = espace libre indéterminé -> ne pas bloquer (un échec transitoire
+    # de lecture ne doit pas refuser tous les ajouts).
+    $ok = if ($free -lt 0) { $true } else { (($NeededBytes + $script:DiskMarginBytes) -le $free) }
+    [pscustomobject]@{
+        Ok     = $ok
+        Free   = $free
+        Needed = $NeededBytes
+        Margin = $script:DiskMarginBytes
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Mise a jour (releases publiques + checksum, fail-closed)
+# ----------------------------------------------------------------------------
 function Get-InstalledVersion {
     $f = Join-Path $PSScriptRoot 'VERSION'
     if (Test-Path $f) {
@@ -120,13 +143,10 @@ function Get-LatestRelease {
     } catch { return $null }
 }
 
-# Renvoie $true si une mise a jour a ete lancee (l'appelant doit alors quitter).
 function Invoke-UpdateCheck {
-    param([switch]$Interactive)   # Interactive = message meme si a jour / hors ligne
+    param([switch]$Interactive)
     $installed = Get-InstalledVersion
     if (-not $installed) {
-        # Pas de fichier VERSION = copie non installée : on ne propose rien en auto
-        # (sinon nag à chaque lancement, et on installerait par-dessus une copie brute).
         if ($Interactive) { Show-Info("Version installée inconnue (cette copie n'a pas été posée par l'installeur). Récupère la dernière version sur la page des releases.") }
         return $false
     }
@@ -144,8 +164,6 @@ function Invoke-UpdateCheck {
          "L'installer maintenant ? Tes dossiers suivis et tes réglages sont conservés."
     if (-not (Confirm-YesNo $m)) { return $false }
     try {
-        # Le checksum est le SEUL contrôle d'intégrité (pas de signature) : fail-closed.
-        # Pas de checksum publié, ou qui ne correspond pas -> on refuse de lancer l'exe.
         if (-not $latest.SumUrl) {
             Show-Warn("Mise à jour annulée : aucun checksum publié pour vérifier le téléchargement (sécurité).")
             return $false
@@ -161,11 +179,9 @@ function Invoke-UpdateCheck {
             Remove-Item $tmp -Force -ErrorAction SilentlyContinue
             return $false
         }
-        # intégrité vérifiée + source HTTPS du dépôt : on retire le marquage
-        # "téléchargé d'internet" pour éviter un avertissement superflu.
         Unblock-File $tmp -ErrorAction SilentlyContinue
         Start-Process -FilePath $tmp
-        return $true   # l'installeur prend le relais ; on quitte
+        return $true
     } catch {
         Show-Warn("La mise à jour a échoué : $($_.Exception.Message)")
         return $false
@@ -173,14 +189,9 @@ function Invoke-UpdateCheck {
 }
 
 # ----------------------------------------------------------------------------
-# Detection du montage Google Drive
+# Detection du montage Google Drive (point de depart du Parcourir + garde "pas de Drive")
 # ----------------------------------------------------------------------------
-# Renvoie une liste d'objets : @{ Type='MyDrive'|'Shared'; Name; Path }
-function Get-DriveSources {
-    $results = New-Object System.Collections.Generic.List[object]
-
-    # bases candidates : lecteurs PRETS (evite de bloquer sur un lecteur reseau
-    # deconnecte) + le home (cas miroir sur C:).
+function Get-DriveRoot {
     $bases = @()
     try {
         $bases += ([System.IO.DriveInfo]::GetDrives() |
@@ -188,37 +199,19 @@ function Get-DriveSources {
             ForEach-Object { $_.RootDirectory.FullName })
     } catch {}
     $bases += $script:HomeRoot
-    $bases = $bases | Select-Object -Unique
-
-    $myDriveNames = @('My Drive', 'Mon Drive')
-    $sharedNames  = @('Shared drives', 'Drive partages', 'Drives partages', 'Disques partages')
-
-    foreach ($base in $bases) {
-        if (-not (Test-Path $base)) { continue }
-
-        foreach ($md in $myDriveNames) {
-            $p = Join-Path $base $md
-            if (Test-Path $p) {
-                try {
-                    Get-ChildItem -LiteralPath $p -Directory -ErrorAction Stop | ForEach-Object {
-                        $results.Add([pscustomobject]@{ Type = 'MyDrive'; Name = $_.Name; Path = $_.FullName })
-                    }
-                } catch { Write-Log "Lecture impossible: $p ($($_.Exception.Message))" 'WARN' }
-            }
-        }
-
-        foreach ($sd in $sharedNames) {
-            $p = Join-Path $base $sd
-            if (Test-Path $p) {
-                try {
-                    Get-ChildItem -LiteralPath $p -Directory -ErrorAction Stop | ForEach-Object {
-                        $results.Add([pscustomobject]@{ Type = 'Shared'; Name = $_.Name; Path = $_.FullName })
-                    }
-                } catch { Write-Log "Lecture impossible: $p ($($_.Exception.Message))" 'WARN' }
-            }
+    foreach ($base in ($bases | Select-Object -Unique)) {
+        foreach ($n in @('My Drive', 'Mon Drive', 'Shared drives', 'Drive partagés', 'Drive partages', 'Disques partagés')) {
+            $p = Join-Path $base $n
+            if (Test-Path $p) { return $base }
         }
     }
-    return $results
+    return $null
+}
+
+# Déduit le type (Mon Drive / Partagé) depuis le chemin.
+function Get-SourceType([string]$Path) {
+    if ($Path -like '*\Shared drives\*' -or $Path -like '*\Drive partag*' -or $Path -like '*\Disques partag*') { return 'Shared' }
+    return 'MyDrive'
 }
 
 # ----------------------------------------------------------------------------
@@ -232,7 +225,6 @@ function Find-FreeFileSync {
         $candidates.Add((Join-Path $b 'Programs\FreeFileSync'))
     }
     $candidates = $candidates | Where-Object { Test-Path $_ } | Select-Object -Unique
-
     foreach ($dir in $candidates) {
         $exe = Join-Path $dir 'FreeFileSync.exe'
         $rts = Join-Path $dir 'RealTimeSync.exe'
@@ -256,17 +248,15 @@ function ConvertTo-XmlSafe([string]$s) {
     return $s
 }
 
-# $Pairs : liste d'objets @{ Left; Right }  (Left = source Drive, Right = local)
-# $Variant : 'TwoWay' (synchro courante) ou 'Mirror' (1er run Drive -> local, sans
-#            jamais toucher au cote Drive). Schema verifie contre un vrai .ffs_batch
-#            format 13 ; FFS convertit vers l'avant a l'ouverture.
+# $Variant : 'TwoWay' (courant) | 'Mirror' (1er run Drive->local) | 'Update' (copie seule).
+# Élément log = <LogFolder/> à la racine (schéma FFS actuel vérifié, config.cpp) ;
+# <Variant> migré par FFS depuis le format 13.
 function New-FfsBatch {
     param(
         [object[]]$Pairs,
         [string]$OutPath,
         [ValidateSet('TwoWay','Mirror','Update')][string]$Variant = 'TwoWay'
     )
-
     $pairBlocks = foreach ($p in $Pairs) {
 @"
         <Pair>
@@ -276,7 +266,6 @@ function New-FfsBatch {
 "@
     }
     $pairsXml = ($pairBlocks -join "`r`n")
-
     $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <FreeFileSync XmlType="BATCH" XmlFormat="13">
@@ -343,18 +332,17 @@ $itemsXml
 }
 
 # ----------------------------------------------------------------------------
-# Autostart : raccourci RealTimeSync dans le dossier Demarrage + tache planifiee
+# Autostart : RealTimeSync (push instantané) + boucle résidente (pull périodique)
 # ----------------------------------------------------------------------------
 function Set-StartupShortcut {
     param([string]$RtsExe, [string]$RealPath)
     if (-not $RtsExe) { return $false }
-    $startup = [Environment]::GetFolderPath('Startup')
-    $lnk = Join-Path $startup 'CoworkBridge.lnk'
+    $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge.lnk'
     $wsh = New-Object -ComObject WScript.Shell
     $sc = $wsh.CreateShortcut($lnk)
     $sc.TargetPath = $RtsExe
     $sc.Arguments  = '"{0}"' -f $RealPath
-    $sc.WindowStyle = 7   # minimise
+    $sc.WindowStyle = 7
     $sc.Description = 'Cowork Bridge - synchro temps reel'
     $sc.Save()
     return $true
@@ -365,70 +353,48 @@ function Remove-StartupShortcut {
     if (Test-Path $lnk) { Remove-Item $lnk -Force }
 }
 
-function Register-SyncTask {
-    param([string]$FfsExe, [string]$BatchPath, [int]$IntervalMin)
-    try {
-        Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
-        $action  = New-ScheduledTaskAction -Execute $FfsExe -Argument ('"{0}"' -f $BatchPath)
-        $trigger = New-ScheduledTaskTrigger -AtLogOn
-        $repeat  = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-                    -RepetitionInterval (New-TimeSpan -Minutes $IntervalMin)
-        $trigger.Repetition = $repeat.Repetition
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-                    -DontStopIfGoingOnBatteries -StartWhenAvailable `
-                    -MultipleInstances IgnoreNew
-        # Pas de -User : enregistrer pour l'utilisateur courant (jeton interactif)
-        # passe sur un compte standard, là où -User déclenche souvent "Accès refusé".
-        Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger `
-            -Settings $settings -Description 'Cowork Bridge - synchro periodique Drive -> local' `
-            -RunLevel Limited | Out-Null
-        return $true
-    } catch {
-        Write-Log "Tache planifiee non creee: $($_.Exception.Message)" 'WARN'
-        return $false
-    }
+function Set-IntervalFile([string]$MetaDir, [int]$IntervalMin) {
+    [System.IO.File]::WriteAllText((Join-Path $MetaDir 'interval'), [string]$IntervalMin, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-function Unregister-SyncTask {
-    Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
-}
-
-# Fallback périodique SANS tâche planifiée (machines verrouillées qui refusent
-# Register-ScheduledTask) : une boucle résidente lancée au démarrage, qui
-# re-synchronise toutes les N min. Sans droits spéciaux (dossier Démarrage).
+# Boucle résidente : relit l'intervalle à chaud, écrit l'heure de prochaine synchro,
+# verrou mono-instance (ne double pas avec RealTimeSync). Sans droits (dossier Démarrage).
 function Set-SyncLoop {
-    param([string]$FfsExe, [string]$BatchPath, [int]$IntervalMin, [string]$MetaDir)
+    param([string]$FfsExe, [string]$BatchPath, [string]$MetaDir, [int]$IntervalMin)
     try {
-        $sec    = $IntervalMin * 60
-        $ffsLit = $FfsExe.Replace("'", "''")
-        $batLit = $BatchPath.Replace("'", "''")
-        $loopPs = Join-Path $MetaDir 'sync-loop.ps1'
+        Set-IntervalFile -MetaDir $MetaDir -IntervalMin $IntervalMin
+        $ffsLit  = $FfsExe.Replace("'", "''")
+        $batLit  = $BatchPath.Replace("'", "''")
+        $metaLit = $MetaDir.Replace("'", "''")
+        $loopPs  = Join-Path $MetaDir 'sync-loop.ps1'
         $loopScript = @"
 # Cowork Bridge - boucle de synchro periodique (genere automatiquement, ne pas editer)
 `$ffs   = '$ffsLit'
 `$batch = '$batLit'
+`$meta  = '$metaLit'
 while (`$true) {
-    try { Start-Process -FilePath `$ffs -ArgumentList ('"{0}"' -f `$batch) -WindowStyle Minimized -Wait } catch {}
-    Start-Sleep -Seconds $sec
+    if (-not (Get-Process FreeFileSync -ErrorAction SilentlyContinue)) {
+        try { Start-Process -FilePath `$ffs -ArgumentList ('"{0}"' -f `$batch) -WindowStyle Minimized -Wait } catch {}
+    }
+    `$min = 30
+    try { `$min = [int]((Get-Content (Join-Path `$meta 'interval') -Raw).Trim()) } catch {}
+    if (`$min -lt 1) { `$min = 1 }
+    try { [System.IO.File]::WriteAllText((Join-Path `$meta 'next-sync'), (Get-Date).AddMinutes(`$min).ToString('o')) } catch {}
+    Start-Sleep -Seconds (`$min * 60)
 }
 "@
         [System.IO.File]::WriteAllText($loopPs, $loopScript, (New-Object System.Text.UTF8Encoding($false)))
-
-        $ps  = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $args = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $loopPs
-        $startup = [Environment]::GetFolderPath('Startup')
-        $lnk = Join-Path $startup 'CoworkBridge-Sync.lnk'
+        $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $argLine = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $loopPs
+        $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge-Sync.lnk'
         $wsh = New-Object -ComObject WScript.Shell
         $sc = $wsh.CreateShortcut($lnk)
         $sc.TargetPath = $ps
-        $sc.Arguments  = $args
+        $sc.Arguments  = $argLine
         $sc.WindowStyle = 7
         $sc.Description = 'Cowork Bridge - synchro periodique'
         $sc.Save()
-
-        # démarrer la boucle tout de suite (sans attendre le prochain logon)
-        try { Start-Process -FilePath $ps -ArgumentList $args -WindowStyle Hidden | Out-Null } catch {}
-        Write-Log "Boucle de synchro periodique installee (toutes les $IntervalMin min, sans tache planifiee)."
+        try { Start-Process -FilePath $ps -ArgumentList $argLine -WindowStyle Hidden | Out-Null } catch {}
         return $true
     } catch {
         Write-Log "Boucle de synchro non installee: $($_.Exception.Message)" 'WARN'
@@ -439,7 +405,6 @@ while (`$true) {
 function Remove-SyncLoop {
     $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge-Sync.lnk'
     if (Test-Path $lnk) { Remove-Item $lnk -Force }
-    # arrêter la boucle résidente en cours (powershell qui exécute sync-loop.ps1)
     try {
         Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -and $_.CommandLine -like '*sync-loop.ps1*' } |
@@ -447,8 +412,12 @@ function Remove-SyncLoop {
     } catch {}
 }
 
+function Unregister-SyncTask {
+    Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
+}
+
 # ----------------------------------------------------------------------------
-# Config (etat persistant)
+# Config (etat persistant) + paires
 # ----------------------------------------------------------------------------
 function Save-Config { param([object]$Config, [string]$Dest)
     $meta = Get-MetaDir $Dest
@@ -461,43 +430,61 @@ function Load-Config { param([string]$Dest)
     return $null
 }
 
-# Construit la liste des paires + dossiers locaux, avec garde anti-collision de noms.
-# Tri déterministe (Type, Name) : l'attribution des noms locaux (et des éventuels
-# suffixes anti-collision) reste stable d'un run à l'autre quel que soit l'ordre
-# d'entrée — indispensable pour que l'ajout d'un dossier ne renomme pas les existants.
+# Tri déterministe (Type, Name) -> noms locaux stables ; garde anti-collision.
 function Build-Pairs { param([object[]]$Selected, [string]$Dest)
     $pairs = New-Object System.Collections.Generic.List[object]
     $used  = New-Object System.Collections.Generic.HashSet[string]
     foreach ($s in ($Selected | Sort-Object Type, Name)) {
-        $prefix = if ($s.Type -eq 'Shared') { 'Partage - ' } else { '' }
-        $base   = ($prefix + $s.Name) -replace '[\\/:*?"<>|]', '_'
-        $localName = $base
-        $n = 2
-        while (-not $used.Add($localName.ToLowerInvariant())) { $localName = "$base ($n)"; $n++ }
+        $persisted = $null
+        if (($s.PSObject.Properties.Name -contains 'LocalName') -and $s.LocalName) { $persisted = [string]$s.LocalName }
+        if ($persisted) {
+            # honorer le nom local déjà sur disque (n'invente pas un nouveau dossier)
+            $localName = $persisted
+            [void]$used.Add($localName.ToLowerInvariant())
+        } else {
+            $prefix = if ($s.Type -eq 'Shared') { 'Partage - ' } else { '' }
+            $base   = ($prefix + $s.Name) -replace '[\\/:*?"<>|]', '_'
+            $localName = $base
+            $n = 2
+            while (-not $used.Add($localName.ToLowerInvariant())) { $localName = "$base ($n)"; $n++ }
+        }
         $localPath = Join-Path $Dest $localName
         $pairs.Add([pscustomobject]@{ Source = $s; Left = $s.Path; Right = $localPath; LocalName = $localName })
     }
     return $pairs
 }
 
+# Nom local d'une source enregistrée (LocalName persisté, sinon recalcul).
+function Resolve-LocalName([object]$Source) {
+    if (($Source.PSObject.Properties.Name -contains 'LocalName') -and $Source.LocalName) { return $Source.LocalName }
+    $prefix = if ($Source.Type -eq 'Shared') { 'Partage - ' } else { '' }
+    return (($prefix + $Source.Name) -replace '[\\/:*?"<>|]', '_')
+}
+
+function Get-SortedSources([object]$Config) {
+    # StrictMode : ne jamais accéder à .sources sans vérifier qu'elle existe
+    # (un config.json antérieur à cette version peut ne pas la porter).
+    if ($Config -and ($Config.PSObject.Properties.Name -contains 'sources') -and $Config.sources) {
+        return @($Config.sources) | Sort-Object Type, Name
+    }
+    return @()
+}
+
 # ----------------------------------------------------------------------------
-# Application d'une installation
+# Application d'une configuration (install initiale, ajout, désync : factorisé)
 # ----------------------------------------------------------------------------
-function Invoke-Install {
+function Apply-Config {
     param(
-        [object[]]$Selected,    # objets sources (Type/Name/Path)
-        [string]$Dest,
-        [int]$IntervalMin,
-        [object]$Ffs,
-        [bool]$FirstRun,        # vrai = nouvelle install (1er run en Miroir)
-        [scriptblock]$Status
+        [object[]]$Selected, [string]$Dest, [int]$IntervalMin,
+        [object]$Ffs, [bool]$FirstRun, [scriptblock]$Status
     )
-    & $Status 'Préparation des dossiers...'
+    $say = { param($m) if ($Status) { & $Status $m } }
+    & $say 'Préparation des dossiers...'
     if (-not (Test-Path $Dest)) { New-Item -ItemType Directory -Path $Dest -Force | Out-Null }
     $meta = Get-MetaDir $Dest
     if (-not (Test-Path $meta)) { New-Item -ItemType Directory -Path $meta -Force | Out-Null }
     $script:LogFile = Join-Path $meta 'bridge.log'
-    Write-Log "=== Installation : $($Selected.Count) dossier(s), FirstRun=$FirstRun ==="
+    Write-Log "=== Application : $($Selected.Count) dossier(s), FirstRun=$FirstRun ==="
 
     $pairs = Build-Pairs -Selected $Selected -Dest $Dest
     $watch = New-Object System.Collections.Generic.List[string]
@@ -508,22 +495,17 @@ function Invoke-Install {
     }
     $pairArray = $pairs | ForEach-Object { [pscustomobject]@{ Left = $_.Left; Right = $_.Right } }
 
-    & $Status 'Génération de la configuration...'
+    & $say 'Génération de la configuration...'
     $batchPath = Join-Path $meta 'bridge.ffs_batch'
     $realPath  = Join-Path $meta 'bridge.ffs_real'
     New-FfsBatch -Pairs $pairArray -OutPath $batchPath -Variant 'TwoWay'
     New-FfsReal  -WatchDirs $watch.ToArray() -FfsExe $Ffs.Exe -BatchPath $batchPath -OutPath $realPath
 
-    & $Status 'Installation de la synchronisation automatique...'
-    $hasRts  = Set-StartupShortcut -RtsExe $Ffs.Rts -RealPath $realPath
-    # Pull régulier : tâche planifiée si la machine l'autorise, sinon boucle résidente
-    # (sans droits) -> dans tous les cas, une synchro complète toutes les N min.
-    $hasTask = Register-SyncTask -FfsExe $Ffs.Exe -BatchPath $batchPath -IntervalMin $IntervalMin
-    Remove-SyncLoop   # repartir propre (évite tâche + boucle en double)
-    $hasLoop = $false
-    if (-not $hasTask) {
-        $hasLoop = Set-SyncLoop -FfsExe $Ffs.Exe -BatchPath $batchPath -IntervalMin $IntervalMin -MetaDir $meta
-    }
+    & $say 'Installation de la synchronisation automatique...'
+    $hasRts = Set-StartupShortcut -RtsExe $Ffs.Rts -RealPath $realPath
+    Unregister-SyncTask                 # nettoie un éventuel ancien mécanisme
+    Remove-SyncLoop                     # repart propre
+    $hasLoop = Set-SyncLoop -FfsExe $Ffs.Exe -BatchPath $batchPath -MetaDir $meta -IntervalMin $IntervalMin
 
     Save-Config -Dest $Dest -Config ([pscustomobject]@{
         version   = 1
@@ -533,17 +515,11 @@ function Invoke-Install {
         ffsRts    = $Ffs.Rts
         batch     = $batchPath
         real      = $realPath
-        # LocalName persiste le nom de dossier local REEL (préfixe + sanitization +
-        # suffixe anti-collision) pour que la libération d'espace supprime le bon
-        # dossier sans le recalculer. @(...) force un tableau JSON ; au reload via
-        # ConvertFrom-Json, toujours réaccéder en @($Config.sources).
         sources   = @($pairs | ForEach-Object { @{ Type = $_.Source.Type; Name = $_.Source.Name; Path = $_.Source.Path; LocalName = $_.LocalName } })
         installed = (Get-Date -Format 's')
     })
 
-    # Premiere synchro : en Miroir Drive -> local sur une nouvelle install
-    # (impossible d'effacer cote Drive) ; sinon synchro deux-sens normale.
-    & $Status 'Première synchronisation (peut prendre un moment sur un gros dossier)...'
+    & $say 'Première synchronisation (peut prendre un moment sur un gros dossier)...'
     if ($FirstRun) {
         $firstPath = Join-Path $meta 'bridge-firstrun.ffs_batch'
         New-FfsBatch -Pairs $pairArray -OutPath $firstPath -Variant 'Mirror'
@@ -553,20 +529,56 @@ function Invoke-Install {
         Write-Log 'Synchro (deux-sens)'
         $proc = Start-Process -FilePath $Ffs.Exe -ArgumentList ('"{0}"' -f $batchPath) -PassThru -Wait
     }
-    Write-Log "Premiere synchro terminee, code $($proc.ExitCode)"
-
-    # demarre RealTimeSync immediatement (sans attendre le prochain logon)
+    Write-Log "Synchro terminee, code $($proc.ExitCode)"
     if ($hasRts) {
         try { Start-Process -FilePath $Ffs.Rts -ArgumentList ('"{0}"' -f $realPath) -WindowStyle Minimized | Out-Null } catch {}
     }
-
-    return [pscustomobject]@{ ExitCode = $proc.ExitCode; Rts = $hasRts; Task = $hasTask; Loop = $hasLoop; Periodic = ($hasTask -or $hasLoop); Batch = $batchPath; Local = $watch.ToArray() }
+    return [pscustomobject]@{ ExitCode = $proc.ExitCode; Rts = $hasRts; Loop = $hasLoop; Batch = $batchPath }
 }
 
-# Sélecteur de dossier façon Explorateur (barre d'adresse + volet de navigation) :
-# OpenFileDialog détourné -> bien plus pratique que l'arborescence classique.
-# Le filtre n'affiche aucun fichier (extension bidon) -> on ne voit que les dossiers.
-# L'utilisateur ouvre le dossier voulu puis clique « Ouvrir » ; on prend ce dossier.
+# Désynchroniser un dossier : remonte son contenu vers Drive (copie seule, sans
+# suppression), puis envoie la copie locale à la corbeille, puis régénère.
+function Remove-TrackedFolder {
+    param([object]$Config, [object]$Source, [object]$Ffs)
+    $meta = Get-MetaDir $Config.dest
+    $script:LogFile = Join-Path $meta 'bridge.log'
+    $local = Join-Path $Config.dest (Resolve-LocalName $Source)
+
+    if (Test-Path $local) {
+        $pushBatch = Join-Path $meta 'bridge-release.ffs_batch'
+        New-FfsBatch -Pairs @([pscustomobject]@{ Left = $local; Right = $Source.Path }) -OutPath $pushBatch -Variant 'Update'
+        $pushed = $false
+        try {
+            $p = Start-Process -FilePath $Config.ffsExe -ArgumentList ('"{0}"' -f $pushBatch) -PassThru -Wait
+            $pushed = ([int]$p.ExitCode -le 1)
+            Write-Log "Désync : remontée Update local->Drive de '$($Source.Name)', code $($p.ExitCode)"
+        } catch { Write-Log "Désync : remontée échouée: $($_.Exception.Message)" 'WARN' }
+        if (-not $pushed) {
+            Show-Warn("La remontée vers Google Drive n'a pas abouti. Par sécurité, la copie locale n'est PAS supprimée (aucune perte).")
+            return $false
+        }
+        try { Remove-ToRecycleBin $local } catch { Write-Log "Désync : corbeille échouée: $local ($($_.Exception.Message))" 'WARN' }
+    }
+
+    $remaining = @(Get-SortedSources $Config | Where-Object { $_.Path -ne $Source.Path })
+    if ($remaining.Count -eq 0) {
+        # plus aucun dossier suivi : on retire la synchro de fond, on garde la config vide
+        Remove-StartupShortcut; Remove-SyncLoop; Unregister-SyncTask
+        try { Get-Process RealTimeSync -ErrorAction SilentlyContinue | Stop-Process -Force } catch {}
+        Save-Config -Dest $Config.dest -Config ([pscustomobject]@{
+            version = 1; dest = $Config.dest; interval = [int]$Config.interval
+            ffsExe = $Config.ffsExe; ffsRts = $Config.ffsRts
+            batch = $Config.batch; real = $Config.real; sources = @(); installed = (Get-Date -Format 's')
+        })
+        return $true
+    }
+    Apply-Config -Selected $remaining -Dest $Config.dest -IntervalMin ([int]$Config.interval) -Ffs $Ffs -FirstRun $false -Status $null | Out-Null
+    return $true
+}
+
+# ----------------------------------------------------------------------------
+# Sélecteur de dossier façon Explorateur (OpenFileDialog détourné, aucun fichier listé)
+# ----------------------------------------------------------------------------
 function Select-DriveFolder {
     param([string]$StartDir)
     $ofd = New-Object System.Windows.Forms.OpenFileDialog
@@ -584,128 +596,120 @@ function Select-DriveFolder {
     return $null
 }
 
+# Construit l'objet source d'un chemin parcouru (avec taille + contrôle disque).
+# Renvoie l'objet, ou $null si annulé / refusé pour cause d'espace.
+function New-BrowsedSource {
+    param([string]$Path, [long]$AlreadyUsedBytes, [string]$Dest, [scriptblock]$Status)
+    $say = { param($m) if ($Status) { & $Status $m } }
+    & $say 'Calcul de la taille du dossier...'
+    $size = Get-FolderSizeBytes $Path
+    $budget = Test-DiskBudget ($AlreadyUsedBytes + $size) $Dest
+    if (-not $budget.Ok) {
+        Show-Warn("Pas assez d'espace sur le disque pour ce dossier." + [Environment]::NewLine +
+                  "Ce dossier ≈ $(Format-Size $size). Libre sur le disque ≈ $(Format-Size $budget.Free)." + [Environment]::NewLine + [Environment]::NewLine +
+                  "Pour éviter de saturer le disque (et bloquer l'ouverture de session Windows), choisis un dossier plus petit, ou libère de la place.")
+        return $null
+    }
+    $leaf = Split-Path $Path -Leaf
+    [pscustomobject]@{ Type = (Get-SourceType $Path); Name = $leaf; Path = $Path; SizeBytes = $size }
+}
+
 # ----------------------------------------------------------------------------
-# GUI - selection des dossiers (install ou modification)
+# GUI - choix des dossiers à la première installation (par l'explorateur)
 # ----------------------------------------------------------------------------
 function Show-SelectionDialog {
-    param(
-        [object[]]$Sources, [object[]]$PreChecked, [string]$Dest, [int]$Interval,
-        [string]$Title = 'Installation', [string]$OkLabel = 'Installer'
-    )
+    param([string]$Dest, [int]$Interval, [string]$StartDir)
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = "$script:AppName - $Title"
-    $form.Size = New-Object System.Drawing.Size(620, 620)
+    $form.Text = "$script:AppName - Installation"
+    $form.Size = New-Object System.Drawing.Size(620, 540)
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
     $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = "Cet outil rend tes dossiers Google Drive accessibles à Claude Cowork." + [Environment]::NewLine +
-                "Coche ceux à rendre accessibles. Seuls les dossiers cochés occuperont" + [Environment]::NewLine +
-                "de l'espace sur cet ordinateur (tout reste aussi dans Drive)."
+    $lbl.Text = "Choisis les dossiers Google Drive à rendre accessibles à Claude Cowork." + [Environment]::NewLine +
+                "Clique « Ajouter un dossier » et navigue jusqu'au dossier voulu. Seuls les" + [Environment]::NewLine +
+                "dossiers ajoutés occuperont de l'espace sur cet ordinateur."
     $lbl.Location = New-Object System.Drawing.Point(15, 12)
     $lbl.Size = New-Object System.Drawing.Size(585, 56)
     $form.Controls.Add($lbl)
 
-    $clb = New-Object System.Windows.Forms.CheckedListBox
-    $clb.Location = New-Object System.Drawing.Point(15, 74)
-    $clb.Size = New-Object System.Drawing.Size(575, 283)
-    $clb.CheckOnClick = $true
-    $clb.IntegralHeight = $false
+    $list = New-Object System.Windows.Forms.ListBox
+    $list.Location = New-Object System.Drawing.Point(15, 74); $list.Size = New-Object System.Drawing.Size(575, 250)
+    $list.IntegralHeight = $false; $list.HorizontalScrollbar = $true
+    $form.Controls.Add($list)
 
-    $preset = @{}
-    if ($PreChecked) { foreach ($p in $PreChecked) { $preset[$p.Path] = $true } }
-
-    $rows = New-Object System.Collections.Generic.List[object]
-    foreach ($s in ($Sources | Sort-Object Type, Name)) {
-        $tag = if ($s.Type -eq 'Shared') { '[Partagé] ' } else { '[Mon Drive] ' }
-        $idx = $clb.Items.Add(($tag + $s.Name))
-        $rows.Add($s)
-        if ($preset.ContainsKey($s.Path)) { $clb.SetItemChecked($idx, $true) }
-    }
-    $form.Controls.Add($clb)
-
-    # Parcourir : cibler n'importe quel dossier (ex. un sous-dossier précis) via l'explorateur
-    $btnBrowse = New-Object System.Windows.Forms.Button
-    $btnBrowse.Text = 'Parcourir un dossier…'
-    $btnBrowse.Location = New-Object System.Drawing.Point(15, 363)
-    $btnBrowse.Size = New-Object System.Drawing.Size(230, 28)
-    $form.Controls.Add($btnBrowse)
-    $btnBrowse.Add_Click({
-        $start = if ($rows.Count -gt 0) { try { Split-Path $rows[0].Path -Parent } catch { $null } } else { $null }
-        $p = Select-DriveFolder -StartDir $start
-        if ($p) {
-            $found = $false
-            for ($i = 0; $i -lt $rows.Count; $i++) {
-                if ($rows[$i].Path -eq $p) { $clb.SetItemChecked($i, $true); $found = $true; break }
-            }
-            if (-not $found) {
-                $t = if ($p -like '*\Shared drives\*' -or $p -like '*\Drive partag*' -or $p -like '*\Disques partag*') { 'Shared' } else { 'MyDrive' }
-                $tag = if ($t -eq 'Shared') { '[Partagé] ' } else { '[Mon Drive] ' }
-                $leaf = Split-Path $p -Leaf
-                $idx = $clb.Items.Add($tag + $leaf)
-                $rows.Add([pscustomobject]@{ Type = $t; Name = $leaf; Path = $p })
-                $clb.SetItemChecked($idx, $true)
-            }
+    $script:selRows = New-Object System.Collections.Generic.List[object]
+    $refresh = {
+        $list.Items.Clear()
+        foreach ($r in $script:selRows) {
+            $tag = if ($r.Type -eq 'Shared') { '[Partagé] ' } else { '[Mon Drive] ' }
+            [void]$list.Items.Add($tag + $r.Name + '  —  ' + (Format-Size $r.SizeBytes))
         }
-    })
+    }
 
-    # destination
+    $btnAdd = New-Object System.Windows.Forms.Button
+    $btnAdd.Text = 'Ajouter un dossier…'
+    $btnAdd.Location = New-Object System.Drawing.Point(15, 330); $btnAdd.Size = New-Object System.Drawing.Size(200, 30)
+    $form.Controls.Add($btnAdd)
+
+    $btnRem = New-Object System.Windows.Forms.Button
+    $btnRem.Text = 'Retirer de la liste'
+    $btnRem.Location = New-Object System.Drawing.Point(225, 330); $btnRem.Size = New-Object System.Drawing.Size(180, 30)
+    $form.Controls.Add($btnRem)
+
     $lblDest = New-Object System.Windows.Forms.Label
     $lblDest.Text = 'Dossier de travail (doit rester dans ton dossier utilisateur) :'
-    $lblDest.Location = New-Object System.Drawing.Point(15, 404)
-    $lblDest.Size = New-Object System.Drawing.Size(575, 20)
+    $lblDest.Location = New-Object System.Drawing.Point(15, 372); $lblDest.Size = New-Object System.Drawing.Size(575, 18)
     $form.Controls.Add($lblDest)
-
     $txtDest = New-Object System.Windows.Forms.TextBox
     $txtDest.Text = $Dest
-    $txtDest.Location = New-Object System.Drawing.Point(15, 426)
-    $txtDest.Size = New-Object System.Drawing.Size(575, 24)
+    $txtDest.Location = New-Object System.Drawing.Point(15, 392); $txtDest.Size = New-Object System.Drawing.Size(575, 24)
     $form.Controls.Add($txtDest)
 
-    # intervalle
     $lblInt = New-Object System.Windows.Forms.Label
     $lblInt.Text = 'Récupérer les changements venant de Drive toutes les (minutes) :'
-    $lblInt.Location = New-Object System.Drawing.Point(15, 460)
-    $lblInt.Size = New-Object System.Drawing.Size(400, 22)
+    $lblInt.Location = New-Object System.Drawing.Point(15, 424); $lblInt.Size = New-Object System.Drawing.Size(400, 22)
     $form.Controls.Add($lblInt)
-
     $numInt = New-Object System.Windows.Forms.NumericUpDown
     $numInt.Minimum = 1; $numInt.Maximum = 1440; $numInt.Value = $Interval
-    $numInt.Location = New-Object System.Drawing.Point(420, 458)
-    $numInt.Size = New-Object System.Drawing.Size(70, 24)
+    $numInt.Location = New-Object System.Drawing.Point(420, 422); $numInt.Size = New-Object System.Drawing.Size(70, 24)
     $form.Controls.Add($numInt)
 
     $status = New-Object System.Windows.Forms.Label
-    $status.Location = New-Object System.Drawing.Point(15, 494)
-    $status.Size = New-Object System.Drawing.Size(575, 40)
+    $status.Location = New-Object System.Drawing.Point(15, 452); $status.Size = New-Object System.Drawing.Size(575, 18)
     $status.ForeColor = [System.Drawing.Color]::DimGray
     $form.Controls.Add($status)
+    $statusCb = { param($m) $status.Text = $m; $status.ForeColor = [System.Drawing.Color]::DimGray; $form.Refresh() }
 
     $btnOk = New-Object System.Windows.Forms.Button
-    $btnOk.Text = $OkLabel
-    $btnOk.Location = New-Object System.Drawing.Point(410, 542)
-    $btnOk.Size = New-Object System.Drawing.Size(95, 30)
+    $btnOk.Text = 'Installer'
+    $btnOk.Location = New-Object System.Drawing.Point(410, 478); $btnOk.Size = New-Object System.Drawing.Size(95, 30)
     $form.Controls.Add($btnOk)
-
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = 'Annuler'
-    $btnCancel.Location = New-Object System.Drawing.Point(510, 542)
-    $btnCancel.Size = New-Object System.Drawing.Size(80, 30)
+    $btnCancel.Location = New-Object System.Drawing.Point(510, 478); $btnCancel.Size = New-Object System.Drawing.Size(80, 30)
     $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $form.Controls.Add($btnCancel)
     $form.CancelButton = $btnCancel
 
     $script:DialogResult = $null
 
+    $btnAdd.Add_Click({
+        $used = ($script:selRows | Measure-Object -Property SizeBytes -Sum).Sum
+        if (-not $used) { $used = [long]0 }
+        $p = Select-DriveFolder -StartDir $StartDir
+        if (-not $p) { return }
+        if ($script:selRows | Where-Object { $_.Path -eq $p }) { $statusCb.Invoke('Ce dossier est déjà dans la liste.'); return }
+        $src = New-BrowsedSource -Path $p -AlreadyUsedBytes ([long]$used) -Dest ($txtDest.Text.Trim()) -Status $statusCb
+        if ($src) { $script:selRows.Add($src); $refresh.Invoke(); $statusCb.Invoke('') }
+    })
+    $btnRem.Add_Click({
+        $i = $list.SelectedIndex
+        if ($i -ge 0 -and $i -lt $script:selRows.Count) { $script:selRows.RemoveAt($i); $refresh.Invoke() }
+    })
     $btnOk.Add_Click({
-        $checked = @()
-        for ($i = 0; $i -lt $clb.Items.Count; $i++) {
-            if ($clb.GetItemChecked($i)) { $checked += $rows[$i] }
-        }
-        if ($checked.Count -eq 0) { $status.Text = 'Coche au moins un dossier.'; $status.ForeColor = [System.Drawing.Color]::Firebrick; return }
-
-        # confinement reel du chemin dans le home (et pas un simple prefixe de chaine)
+        if ($script:selRows.Count -eq 0) { $statusCb.Invoke('Ajoute au moins un dossier.'); $status.ForeColor = [System.Drawing.Color]::Firebrick; return }
         $d = $txtDest.Text.Trim()
         $ok = $false
         try {
@@ -714,12 +718,9 @@ function Show-SelectionDialog {
             $ok = $dFull.Equals($homeFull, [System.StringComparison]::OrdinalIgnoreCase) -or
                   $dFull.StartsWith($homeFull + '\', [System.StringComparison]::OrdinalIgnoreCase)
         } catch { $ok = $false }
-        if (-not $ok) {
-            $status.Text = "Le dossier doit être dans : $script:HomeRoot (contrainte Cowork)."
-            $status.ForeColor = [System.Drawing.Color]::Firebrick; return
-        }
+        if (-not $ok) { $statusCb.Invoke("Le dossier doit être dans : $script:HomeRoot"); $status.ForeColor = [System.Drawing.Color]::Firebrick; return }
         $script:DialogResult = [pscustomobject]@{
-            Selected = $checked
+            Selected = @($script:selRows | ForEach-Object { [pscustomobject]@{ Type = $_.Type; Name = $_.Name; Path = $_.Path } })
             Dest     = ([System.IO.Path]::GetFullPath($d).TrimEnd('\'))
             Interval = [int]$numInt.Value
         }
@@ -731,85 +732,179 @@ function Show-SelectionDialog {
 }
 
 # ----------------------------------------------------------------------------
-# GUI - panneau de gestion (install existante)
+# GUI - panneau de gestion = centre de contrôle
 # ----------------------------------------------------------------------------
 function Show-ManageDialog {
-    param([object]$Config)
+    param([object]$Config, [object]$Ffs)
 
+    $script:mgConfig = $Config
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "$script:AppName - Gestion"
-    $form.Size = New-Object System.Drawing.Size(560, 400)
+    $form.Size = New-Object System.Drawing.Size(560, 540)
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
     $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = "Cowork Bridge est actif." + [Environment]::NewLine +
-                "Dossier de travail : $($Config.dest)" + [Environment]::NewLine +
-                "Synchronisation automatique : toutes les $($Config.interval) min" + [Environment]::NewLine + [Environment]::NewLine +
-                "À connecter dans Cowork (et surtout pas le dossier Google Drive) :" + [Environment]::NewLine +
-                "$($Config.dest)"
-    $lbl.Location = New-Object System.Drawing.Point(20, 18)
-    $lbl.Size = New-Object System.Drawing.Size(510, 95)
+    $lbl.Location = New-Object System.Drawing.Point(20, 14); $lbl.Size = New-Object System.Drawing.Size(510, 58)
     $form.Controls.Add($lbl)
 
+    $lblList = New-Object System.Windows.Forms.Label
+    $lblList.Text = 'Dossiers synchronisés par Cowork Bridge :'
+    $lblList.Location = New-Object System.Drawing.Point(20, 76); $lblList.Size = New-Object System.Drawing.Size(510, 18)
+    $form.Controls.Add($lblList)
+    $list = New-Object System.Windows.Forms.ListBox
+    $list.Location = New-Object System.Drawing.Point(20, 96); $list.Size = New-Object System.Drawing.Size(510, 110)
+    $list.IntegralHeight = $false; $list.HorizontalScrollbar = $true
+    $form.Controls.Add($list)
+
+    $script:mgSources = @()
+    $reload = {
+        $script:mgConfig = Load-Config -Dest $Config.dest
+        $script:mgSources = @(Get-SortedSources $script:mgConfig)
+        $list.Items.Clear()
+        foreach ($s in $script:mgSources) {
+            $tag = if ($s.Type -eq 'Shared') { '[Partagé] ' } else { '[Mon Drive] ' }
+            [void]$list.Items.Add($tag + $s.Name)
+        }
+        $lbl.Text = "Cowork Bridge est actif." + [Environment]::NewLine +
+                    "À connecter dans Cowork (et surtout pas le dossier Google Drive) :" + [Environment]::NewLine +
+                    "$($script:mgConfig.dest)"
+    }
+    $reload.Invoke()
+
+    # ligne minuteur
+    $lblTimer = New-Object System.Windows.Forms.Label
+    $lblTimer.Location = New-Object System.Drawing.Point(20, 212); $lblTimer.Size = New-Object System.Drawing.Size(510, 18)
+    $lblTimer.ForeColor = [System.Drawing.Color]::DimGray
+    $form.Controls.Add($lblTimer)
+
+    # délai + appliquer
+    $lblInt = New-Object System.Windows.Forms.Label
+    $lblInt.Text = 'Synchroniser depuis Drive toutes les (min) :'
+    $lblInt.Location = New-Object System.Drawing.Point(20, 238); $lblInt.Size = New-Object System.Drawing.Size(270, 22)
+    $form.Controls.Add($lblInt)
+    $numInt = New-Object System.Windows.Forms.NumericUpDown
+    $numInt.Minimum = 1; $numInt.Maximum = 1440; $numInt.Value = [int]$Config.interval
+    $numInt.Location = New-Object System.Drawing.Point(295, 236); $numInt.Size = New-Object System.Drawing.Size(70, 24)
+    $form.Controls.Add($numInt)
+    $btnInt = New-Object System.Windows.Forms.Button
+    $btnInt.Text = 'Appliquer'
+    $btnInt.Location = New-Object System.Drawing.Point(375, 235); $btnInt.Size = New-Object System.Drawing.Size(155, 26)
+    $form.Controls.Add($btnInt)
+
+    # boutons actions (2 colonnes)
     $btnAdd = New-Object System.Windows.Forms.Button
     $btnAdd.Text = 'Ajouter un dossier'
-    $btnAdd.Location = New-Object System.Drawing.Point(20, 124); $btnAdd.Size = New-Object System.Drawing.Size(245, 34)
+    $btnAdd.Location = New-Object System.Drawing.Point(20, 272); $btnAdd.Size = New-Object System.Drawing.Size(245, 32)
     $form.Controls.Add($btnAdd)
+    $btnDesync = New-Object System.Windows.Forms.Button
+    $btnDesync.Text = 'Désynchroniser le dossier sélectionné'
+    $btnDesync.Location = New-Object System.Drawing.Point(285, 272); $btnDesync.Size = New-Object System.Drawing.Size(245, 32)
+    $form.Controls.Add($btnDesync)
 
     $btnSync = New-Object System.Windows.Forms.Button
     $btnSync.Text = 'Synchroniser maintenant'
-    $btnSync.Location = New-Object System.Drawing.Point(285, 124); $btnSync.Size = New-Object System.Drawing.Size(245, 34)
+    $btnSync.Location = New-Object System.Drawing.Point(20, 310); $btnSync.Size = New-Object System.Drawing.Size(245, 32)
     $form.Controls.Add($btnSync)
-
-    $btnEdit = New-Object System.Windows.Forms.Button
-    $btnEdit.Text = 'Modifier la sélection'
-    $btnEdit.Location = New-Object System.Drawing.Point(20, 166); $btnEdit.Size = New-Object System.Drawing.Size(245, 34)
-    $form.Controls.Add($btnEdit)
-
     $btnOpen = New-Object System.Windows.Forms.Button
     $btnOpen.Text = 'Ouvrir le dossier local'
-    $btnOpen.Location = New-Object System.Drawing.Point(285, 166); $btnOpen.Size = New-Object System.Drawing.Size(245, 34)
+    $btnOpen.Location = New-Object System.Drawing.Point(285, 310); $btnOpen.Size = New-Object System.Drawing.Size(245, 32)
     $form.Controls.Add($btnOpen)
-
-    $btnUninstall = New-Object System.Windows.Forms.Button
-    $btnUninstall.Text = 'Désinstaller Cowork Bridge'
-    $btnUninstall.Location = New-Object System.Drawing.Point(20, 208); $btnUninstall.Size = New-Object System.Drawing.Size(245, 34)
-    $form.Controls.Add($btnUninstall)
 
     $btnUpdate = New-Object System.Windows.Forms.Button
     $btnUpdate.Text = 'Vérifier les mises à jour'
-    $btnUpdate.Location = New-Object System.Drawing.Point(285, 208); $btnUpdate.Size = New-Object System.Drawing.Size(245, 34)
+    $btnUpdate.Location = New-Object System.Drawing.Point(20, 348); $btnUpdate.Size = New-Object System.Drawing.Size(245, 32)
     $form.Controls.Add($btnUpdate)
+    $btnUninstall = New-Object System.Windows.Forms.Button
+    $btnUninstall.Text = 'Désinstaller Cowork Bridge'
+    $btnUninstall.Location = New-Object System.Drawing.Point(285, 348); $btnUninstall.Size = New-Object System.Drawing.Size(245, 32)
+    $form.Controls.Add($btnUninstall)
 
     $status = New-Object System.Windows.Forms.Label
-    $status.Location = New-Object System.Drawing.Point(20, 252); $status.Size = New-Object System.Drawing.Size(510, 50)
+    $status.Location = New-Object System.Drawing.Point(20, 392); $status.Size = New-Object System.Drawing.Size(510, 56)
     $status.ForeColor = [System.Drawing.Color]::DimGray
     $form.Controls.Add($status)
 
     $btnClose = New-Object System.Windows.Forms.Button
     $btnClose.Text = 'Fermer'
-    $btnClose.Location = New-Object System.Drawing.Point(440, 312); $btnClose.Size = New-Object System.Drawing.Size(90, 30)
+    $btnClose.Location = New-Object System.Drawing.Point(440, 458); $btnClose.Size = New-Object System.Drawing.Size(90, 30)
     $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $form.Controls.Add($btnClose)
 
-    $script:ManageAction = $null
-
-    $btnSync.Add_Click({
-        $status.Text = 'Synchronisation en cours...'; $status.ForeColor = [System.Drawing.Color]::DimGray; $form.Refresh()
+    # minuteur live (lit _bridge\next-sync)
+    $nextFile = Join-Path (Get-MetaDir $Config.dest) 'next-sync'
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 1000
+    $timer.Add_Tick({
+        $txt = 'Prochaine synchronisation : —'
         try {
-            $p = Start-Process -FilePath $Config.ffsExe -ArgumentList ('"{0}"' -f $Config.batch) -PassThru -Wait
-            $status.Text = (Get-SyncResultText ([int]$p.ExitCode))
-        } catch { $status.Text = "La synchronisation n'a pas pu démarrer : $($_.Exception.Message)" }
+            if (Test-Path $nextFile) {
+                $next = [datetime]::Parse((Get-Content $nextFile -Raw).Trim())
+                $rem = $next - (Get-Date)
+                if ($rem.TotalSeconds -le 0) { $txt = 'Prochaine synchronisation : imminente' }
+                else { $txt = 'Prochaine synchronisation dans {0:mm\:ss}' -f $rem }
+            }
+        } catch {}
+        $lblTimer.Text = $txt
     })
-    $btnOpen.Add_Click({ Start-Process explorer.exe -ArgumentList ('"{0}"' -f $Config.dest) })
-    $btnAdd.Add_Click({ $script:ManageAction = 'add'; $form.Close() })
-    $btnEdit.Add_Click({ $script:ManageAction = 'edit'; $form.Close() })
-    $btnUninstall.Add_Click({ $script:ManageAction = 'uninstall'; $form.Close() })
+    $timer.Start()
+    $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose() })
+
+    $busy = { param($m) $status.ForeColor = [System.Drawing.Color]::DimGray; $status.Text = $m; $form.Refresh() }
+
+    $btnInt.Add_Click({
+        $min = [int]$numInt.Value
+        $meta = Get-MetaDir $script:mgConfig.dest
+        Set-IntervalFile -MetaDir $meta -IntervalMin $min
+        try { [System.IO.File]::WriteAllText((Join-Path $meta 'next-sync'), (Get-Date).AddMinutes($min).ToString('o'), (New-Object System.Text.UTF8Encoding($false))) } catch {}
+        $cfg = $script:mgConfig; $cfg.interval = $min; Save-Config -Dest $cfg.dest -Config $cfg
+        $busy.Invoke("Délai mis à jour : toutes les $min min.")
+    })
+    $btnAdd.Add_Click({
+        $start = Get-DriveRoot
+        $p = Select-DriveFolder -StartDir $start
+        if (-not $p) { return }
+        if ($script:mgSources | Where-Object { $_.Path -eq $p }) { $busy.Invoke('Ce dossier est déjà suivi.'); return }
+        # les dossiers déjà suivis sont déjà sur le disque -> l'espace libre les reflète déjà ;
+        # on ne vérifie que le nouveau dossier.
+        $busy.Invoke('Calcul de la taille...')
+        $src = New-BrowsedSource -Path $p -AlreadyUsedBytes ([long]0) -Dest $script:mgConfig.dest -Status $busy
+        if (-not $src) { $busy.Invoke(''); return }
+        $busy.Invoke('Ajout et synchronisation...')
+        $newSel = @($script:mgSources | ForEach-Object { [pscustomobject]@{ Type = $_.Type; Name = $_.Name; Path = $_.Path } }) + @([pscustomobject]@{ Type = $src.Type; Name = $src.Name; Path = $src.Path })
+        try {
+            $res = Apply-Config -Selected $newSel -Dest $script:mgConfig.dest -IntervalMin ([int]$script:mgConfig.interval) -Ffs $Ffs -FirstRun $false -Status $null
+            $reload.Invoke()
+            $busy.Invoke((Get-SyncResultText ([int]$res.ExitCode)))
+        } catch { $busy.Invoke("L'ajout a échoué : $($_.Exception.Message)") }
+    })
+    $btnDesync.Add_Click({
+        $i = $list.SelectedIndex
+        if ($i -lt 0 -or $i -ge $script:mgSources.Count) { $busy.Invoke('Sélectionne d''abord un dossier dans la liste.'); return }
+        $src = $script:mgSources[$i]
+        $m = "Désynchroniser « $($src.Name) » ?" + [Environment]::NewLine + [Environment]::NewLine +
+             "Son contenu est d'abord renvoyé vers Google Drive, puis la copie locale part" + [Environment]::NewLine +
+             "à la corbeille. Rien n'est supprimé côté Drive."
+        if (-not (Confirm-YesNo $m)) { return }
+        $busy.Invoke('Remontée vers Drive puis libération...')
+        try {
+            if (Remove-TrackedFolder -Config $script:mgConfig -Source $src -Ffs $Ffs) {
+                $reload.Invoke(); $busy.Invoke("« $($src.Name) » n'est plus synchronisé.")
+            }
+        } catch { $busy.Invoke("La désynchronisation a échoué : $($_.Exception.Message)") }
+    })
+    $btnSync.Add_Click({
+        $busy.Invoke('Synchronisation en cours...')
+        try {
+            $p = Start-Process -FilePath $script:mgConfig.ffsExe -ArgumentList ('"{0}"' -f $script:mgConfig.batch) -PassThru -Wait
+            $busy.Invoke((Get-SyncResultText ([int]$p.ExitCode)))
+        } catch { $busy.Invoke("La synchronisation n'a pas pu démarrer : $($_.Exception.Message)") }
+    })
+    $btnOpen.Add_Click({ Start-Process explorer.exe -ArgumentList ('"{0}"' -f $script:mgConfig.dest) })
     $btnUpdate.Add_Click({ if (Invoke-UpdateCheck -Interactive) { $form.Close() } })
+    $btnUninstall.Add_Click({ $form.Close(); Invoke-Uninstall -Config $script:mgConfig })
 
     [void]$form.ShowDialog()
-    return $script:ManageAction
 }
 
 # ----------------------------------------------------------------------------
@@ -820,10 +915,8 @@ function Show-Warn($msg)  { [void][System.Windows.Forms.MessageBox]::Show($msg, 
 function Confirm-YesNo($msg) { return ([System.Windows.Forms.MessageBox]::Show($msg, $script:AppName, 'YesNo', 'Question') -eq 'Yes') }
 
 function Start-Bridge {
-    # 0. Mise à jour disponible ? (silencieux si à jour ou hors ligne)
-    if (Invoke-UpdateCheck) { return }   # l'installeur de mise à jour prend le relais
+    if (Invoke-UpdateCheck) { return }
 
-    # 1. FreeFileSync present ?
     $ffs = Find-FreeFileSync
     if (-not $ffs) {
         $m = "Cowork Bridge a besoin d'un logiciel gratuit, FreeFileSync, pour copier tes fichiers." + [Environment]::NewLine +
@@ -834,141 +927,45 @@ function Start-Bridge {
         return
     }
 
-    # 2. installation existante ?
+    # Installation existante -> centre de contrôle (gère tout en place)
     $existing = Load-Config -Dest $script:DefaultDest
-    $mode = 'install'
-    if ($existing) {
-        $action = Show-ManageDialog -Config $existing
-        switch ($action) {
-            'uninstall' { Invoke-Uninstall -Config $existing; return }
-            'add'       { $mode = 'add' }    # ajouter un/des dossier(s) aux dossiers suivis
-            'edit'      { $mode = 'edit' }   # revoir toute la selection
-            default     { return }
-        }
-    }
-
-    # 3. detection des sources Drive
-    $sources = Get-DriveSources
-    if (-not $sources -or $sources.Count -eq 0) {
-        $m = "Aucun dossier Google Drive détecté sur cet ordinateur." + [Environment]::NewLine + [Environment]::NewLine +
-             "Vérifie que Google Drive pour ordinateur est lancé, que tu y es connecté à ton" + [Environment]::NewLine +
-             "compte, et qu'il est réglé sur « Accéder en ligne aux fichiers » (Paramètres →" + [Environment]::NewLine +
-             "Préférences → Dossiers de Drive → Options de synchronisation de Mon Drive)." + [Environment]::NewLine + [Environment]::NewLine +
-             "Relance ensuite Cowork Bridge."
-        Show-Warn $m
+    if ($existing -and @(Get-SortedSources $existing).Count -gt 0) {
+        Show-ManageDialog -Config $existing -Ffs $ffs
         return
     }
 
-    # 4. selection (selon le mode)
-    if ($mode -eq 'add') {
-        # n'afficher que les dossiers PAS ENCORE suivis ; on ajoute sans rien retirer.
-        $trackedPaths = @($existing.sources | ForEach-Object { $_.Path })
-        $untracked = @($sources | Where-Object { $trackedPaths -notcontains $_.Path })
-        if ($untracked.Count -eq 0) {
-            Show-Info("Tous les dossiers Google Drive détectés sont déjà suivis." + [Environment]::NewLine +
-                      "Pour en suivre un nouveau, crée-le d'abord dans Google Drive, puis reviens ici.")
-            return
-        }
-        $choice = Show-SelectionDialog -Sources $untracked -PreChecked $null -Dest $existing.dest -Interval ([int]$existing.interval) -Title 'Ajouter un dossier' -OkLabel 'Ajouter'
-        if (-not $choice) { return }
-        # union avec les dossiers déjà suivis ; dossier de travail inchangé, aucun retrait.
-        $choice.Selected = @($existing.sources) + @($choice.Selected)
-        $choice.Dest = $existing.dest
+    # Première installation : choix des dossiers par l'explorateur
+    $start = Get-DriveRoot
+    if (-not $start) {
+        $m = "Aucun dossier Google Drive détecté sur cet ordinateur." + [Environment]::NewLine + [Environment]::NewLine +
+             "Vérifie que Google Drive pour ordinateur est lancé, connecté à ton compte, et réglé sur" + [Environment]::NewLine +
+             "« Accéder en ligne aux fichiers » (Paramètres → Préférences → Dossiers de Drive)." + [Environment]::NewLine +
+             "Tu peux quand même continuer et parcourir manuellement."
+        Show-Warn $m
     }
-    elseif ($mode -eq 'edit') {
-        $choice = Show-SelectionDialog -Sources $sources -PreChecked $existing.sources -Dest $existing.dest -Interval ([int]$existing.interval) -Title 'Modifier la sélection' -OkLabel 'Enregistrer'
-        if (-not $choice) { return }
-    }
-    else {
-        $choice = Show-SelectionDialog -Sources $sources -PreChecked $null -Dest $script:DefaultDest -Interval $script:DefaultInterval -Title 'Installation' -OkLabel 'Installer'
-        if (-not $choice) { return }
-    }
+    $choice = Show-SelectionDialog -Dest $script:DefaultDest -Interval $script:DefaultInterval -StartDir $start
+    if (-not $choice) { return }
 
-    # 5. nettoyage des dossiers retires (modification de selection)
-    if ($existing) {
-        $newPaths = @($choice.Selected | ForEach-Object { $_.Path })
-        # @() requis : ConvertFrom-Json renvoie un scalaire pour un sources mono-element.
-        $removed = @($existing.sources | Where-Object { $newPaths -notcontains $_.Path })
-        if ($removed.Count -gt 0) {
-            $m = "Tu as retiré $($removed.Count) dossier(s) de la sélection." + [Environment]::NewLine + [Environment]::NewLine +
-                 "Leur contenu va d'abord être renvoyé vers Google Drive, puis la copie locale" + [Environment]::NewLine +
-                 "sera envoyée à la corbeille pour libérer de l'espace. Aucun fichier n'est perdu :" + [Environment]::NewLine +
-                 "rien n'est supprimé côté Drive, et la suppression locale est récupérable." + [Environment]::NewLine + [Environment]::NewLine +
-                 "Renvoyer vers Drive puis libérer l'espace ?"
-            if (Confirm-YesNo $m) {
-                $script:LogFile = Join-Path (Get-MetaDir $existing.dest) 'bridge.log'
-
-                # Nom de dossier local RÉEL : persisté en config (LocalName) ; recalcul
-                # de repli pour une config antérieure qui ne le porterait pas.
-                $removedInfo = foreach ($r in $removed) {
-                    $hasLn = ($r.PSObject.Properties.Name -contains 'LocalName') -and $r.LocalName
-                    $ln = if ($hasLn) { $r.LocalName }
-                          else {
-                              $prefix = if ($r.Type -eq 'Shared') { 'Partage - ' } else { '' }
-                              ($prefix + $r.Name) -replace '[\\/:*?"<>|]', '_'
-                          }
-                    [pscustomobject]@{ Local = (Join-Path $existing.dest $ln); Drive = $r.Path }
-                }
-
-                # Sauvegarde AVANT suppression : Update local -> Drive (copie seulement,
-                # ne supprime jamais rien). On ne relance PAS le batch TwoWay global,
-                # qui pourrait propager une suppression locale vers Drive.
-                $pushPairs = @($removedInfo | Where-Object { Test-Path $_.Local } |
-                               ForEach-Object { [pscustomobject]@{ Left = $_.Local; Right = $_.Drive } })
-                $pushed = $true
-                if ($pushPairs.Count -gt 0) {
-                    $pushBatch = Join-Path (Get-MetaDir $existing.dest) 'bridge-release.ffs_batch'
-                    New-FfsBatch -Pairs $pushPairs -OutPath $pushBatch -Variant 'Update'
-                    try {
-                        $p = Start-Process -FilePath $existing.ffsExe -ArgumentList ('"{0}"' -f $pushBatch) -PassThru -Wait
-                        $pushed = ([int]$p.ExitCode -le 1)   # 0 = ok, 1 = avertissements
-                        Write-Log "Sauvegarde avant liberation (Update local -> Drive), code $($p.ExitCode)"
-                    } catch { $pushed = $false; Write-Log "Sauvegarde avant liberation echouee: $($_.Exception.Message)" 'WARN' }
-                }
-
-                if (-not $pushed) {
-                    Show-Warn("La sauvegarde vers Google Drive n'a pas abouti." + [Environment]::NewLine +
-                              "Par sécurité, les copies locales NE sont PAS supprimées (aucune perte).")
-                } else {
-                    foreach ($ri in $removedInfo) {
-                        if (Test-Path $ri.Local) {
-                            try { Remove-ToRecycleBin $ri.Local } catch { Write-Log "Liberation locale echouee (corbeille): $($ri.Local) ($($_.Exception.Message))" 'WARN' }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    # 6. application
     $progress = New-Object System.Windows.Forms.Form
     $progress.Text = "$script:AppName"; $progress.Size = New-Object System.Drawing.Size(470, 130)
     $progress.StartPosition = 'CenterScreen'; $progress.ControlBox = $false
     $progress.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $pl = New-Object System.Windows.Forms.Label
-    $pl.Location = New-Object System.Drawing.Point(20, 30); $pl.Size = New-Object System.Drawing.Size(420, 60)
-    $pl.Text = 'Installation...'
-    $progress.Controls.Add($pl)
-    $progress.Show(); $progress.Refresh()
+    $pl.Location = New-Object System.Drawing.Point(20, 30); $pl.Size = New-Object System.Drawing.Size(420, 60); $pl.Text = 'Installation...'
+    $progress.Controls.Add($pl); $progress.Show(); $progress.Refresh()
     $statusCb = { param($m) $pl.Text = $m; $progress.Refresh() }
 
     try {
-        $res = Invoke-Install -Selected $choice.Selected -Dest $choice.Dest -IntervalMin $choice.Interval `
-                              -Ffs $ffs -FirstRun (-not $existing) -Status $statusCb
+        $res = Apply-Config -Selected $choice.Selected -Dest $choice.Dest -IntervalMin $choice.Interval -Ffs $ffs -FirstRun $true -Status $statusCb
         $progress.Close()
-
-        $auto = if ($res.Rts -and $res.Periodic) {
+        $auto = if ($res.Rts -and $res.Loop) {
             "La synchronisation tourne maintenant toute seule en arrière-plan :" + [Environment]::NewLine +
             "  - tes modifications partent vers Google Drive en temps réel ;" + [Environment]::NewLine +
             "  - les changements venant de Drive sont récupérés toutes les $($choice.Interval) min."
-        } elseif ($res.Rts) {
-            "Tes modifications partent vers Google Drive en temps réel, et une synchro" + [Environment]::NewLine +
-            "complète a lieu à chaque démarrage de Windows. (Le rafraîchissement toutes les" + [Environment]::NewLine +
-            "$($choice.Interval) min n'a pas pu être installé sur cette machine.)"
         } else {
-            "La synchronisation automatique n'a pas pu être configurée. Voir le guide (dépannage)."
+            "Tes modifications partent vers Google Drive en temps réel." + [Environment]::NewLine +
+            "Le rafraîchissement périodique n'a pas pu être installé — voir le guide (dépannage)."
         }
-
         $msg = "Installation terminée." + [Environment]::NewLine + [Environment]::NewLine +
                "Dernière étape, dans Claude Cowork : connecte le dossier ci-dessous —" + [Environment]::NewLine +
                "et surtout pas ton dossier Google Drive :" + [Environment]::NewLine + [Environment]::NewLine +
@@ -976,29 +973,22 @@ function Start-Bridge {
                "Si Cowork affiche un dossier vide, c'est presque toujours qu'on a connecté" + [Environment]::NewLine +
                "le dossier Google Drive au lieu de celui-ci." + [Environment]::NewLine + [Environment]::NewLine +
                $auto + [Environment]::NewLine + [Environment]::NewLine +
-               "Espace utilisé sur le PC ≈ la taille des dossiers cochés (tout reste aussi dans Drive)." + [Environment]::NewLine + [Environment]::NewLine +
                (Get-SyncResultText ([int]$res.ExitCode))
         Show-Info $msg
     } catch {
         if ($progress.Visible) { $progress.Close() }
         Write-Log "ERREUR installation: $($_.Exception.Message)" 'ERROR'
-        Show-Warn("L'installation a échoué :" + [Environment]::NewLine + $($_.Exception.Message) + [Environment]::NewLine + [Environment]::NewLine +
-                  "Le détail est dans le journal (bouton « Ouvrir le dossier local », sous-dossier _bridge).")
+        Show-Warn("L'installation a échoué :" + [Environment]::NewLine + $($_.Exception.Message))
     }
 }
 
 function Invoke-Uninstall {
     param([object]$Config)
     $m = "Désinstaller Cowork Bridge ?" + [Environment]::NewLine + [Environment]::NewLine +
-         "Une dernière synchro est lancée, puis la synchronisation automatique est retirée." + [Environment]::NewLine +
-         "Ton dossier local n'est PAS supprimé (tu pourras l'effacer à la main plus tard si" + [Environment]::NewLine +
-         "tu veux récupérer l'espace). Aucun fichier n'est perdu."
+         "La synchronisation automatique est retirée. Ton dossier local n'est PAS supprimé" + [Environment]::NewLine +
+         "(tu pourras l'effacer à la main pour récupérer l'espace). Aucun fichier n'est perdu."
     if (-not (Confirm-YesNo $m)) { return }
     $script:LogFile = Join-Path (Get-MetaDir $Config.dest) 'bridge.log'
-    try {
-        $p = Start-Process -FilePath $Config.ffsExe -ArgumentList ('"{0}"' -f $Config.batch) -PassThru -Wait
-        Write-Log "Synchro avant desinstallation, code $($p.ExitCode)"
-    } catch { Write-Log "Synchro avant desinstallation echouee: $($_.Exception.Message)" 'WARN' }
     Unregister-SyncTask
     Remove-StartupShortcut
     Remove-SyncLoop

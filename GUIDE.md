@@ -22,7 +22,7 @@ Cloud Google  →  Google Drive (sur ton PC)  →  dossier de travail  →  Clau
 ## Installation
 
 1. Lance **CoworkBridge-Setup.exe** et suis l'assistant (tu peux cocher « Créer une icône sur le bureau »).
-2. À la fin, l'écran de configuration s'ouvre. Coche les dossiers Drive (Mon Drive et/ou Drive partagés) à **rendre accessibles à Claude Cowork**. Ne coche que ce sur quoi tu travailles — c'est ce qui occupera de l'espace sur le PC.
+2. À la fin, l'écran de configuration s'ouvre. Clique **« Ajouter un dossier »**, navigue jusqu'au dossier Google Drive voulu et ouvre-le ; répète pour chaque dossier. N'ajoute que ce sur quoi tu travailles — c'est ce qui occupera de l'espace sur le PC (l'outil **refuse** un dossier qui ne tiendrait pas sur le disque).
 3. Laisse le **dossier de travail** par défaut (`C:\Users\<toi>\CoworkWork`) — il doit rester dans ton dossier utilisateur.
 4. Clique **Installer**. La première copie depuis Drive se lance.
 5. Dans **Claude Cowork**, connecte le **dossier de travail** : `C:\Users\<toi>\CoworkWork` — **et surtout pas** ton dossier Google Drive.
@@ -45,19 +45,21 @@ Pour forcer une synchronisation immédiate : ouvre **Cowork Bridge** (icône du 
 
 Cowork Bridge se met à jour tout seul : au lancement, s'il existe une version plus récente, il te propose de l'installer (tes dossiers suivis et réglages sont conservés). Tu peux aussi cliquer **« Vérifier les mises à jour »** dans la fenêtre de gestion.
 
-## Ajouter ou retirer un dossier
+## Gérer (ajouter, désynchroniser, changer la fréquence)
 
-Ouvre **Cowork Bridge** (icône du bureau, ou menu Démarrer → **Configurer Cowork Bridge**) :
+Ouvre **Cowork Bridge** (icône du bureau, ou menu Démarrer → **Configurer Cowork Bridge**). La fenêtre liste les **dossiers actuellement synchronisés** et affiche un **minuteur** avant la prochaine synchro.
 
-- **Ajouter un dossier** → bouton **« Ajouter un dossier »** → coche le(s) nouveau(x) dossier(s) → **Ajouter**. Le dossier est copié depuis Drive et apparaît dans ton dossier de travail. **Rien à retoucher dans Cowork.**
+- **Ajouter un dossier** → **« Ajouter un dossier »** → navigue jusqu'au dossier et ouvre-le. Il est copié depuis Drive ; rien à retoucher dans Cowork.
 - **Pas besoin pour un sous-dossier** : tout ce qui est créé **à l'intérieur** d'un dossier déjà suivi se synchronise tout seul. Tu ne reviens ici que pour un nouveau dossier de **premier niveau**.
-- **Retirer un dossier** → bouton **« Modifier la sélection »** → décoche. Son contenu est d'abord **renvoyé vers Google Drive**, puis la copie locale part à la **corbeille** pour libérer de l'espace. Si le renvoi échoue, rien n'est supprimé.
+- **Désynchroniser un dossier** → sélectionne-le dans la liste → **« Désynchroniser le dossier sélectionné »**. Son contenu est d'abord **renvoyé vers Google Drive**, puis la copie locale part à la **corbeille**. Côté Drive, rien n'est touché ; si le renvoi échoue, rien n'est supprimé.
+- **Changer la fréquence de synchro** → règle le délai (en minutes) → **« Appliquer »**. Le changement prend effet sans rien réinstaller.
 
 ## Gérer l'espace disque
 
 Cowork Bridge **réduit** ton espace utilisé si tu étais en mode « Dupliquer les fichiers » (qui télécharge tout le Drive). En mode « Accéder en ligne aux fichiers » + sélection ciblée, le PC ne contient que les dossiers suivis.
 
-- **Espace occupé ≈ taille des dossiers cochés.** Jamais tout le Drive.
+- **Espace occupé ≈ taille des dossiers suivis.** Jamais tout le Drive.
+- L'outil **vérifie l'espace libre avant d'ajouter un dossier** et **refuse** si ça ne tient pas — pour ne jamais saturer le disque (un disque plein empêche Windows d'ouvrir ta session).
 - Le dossier de travail (`CoworkWork`) n'est qu'une **copie de travail** : tout y est aussi dans Drive (et dans le cloud).
 
 ## Dépannage
@@ -67,7 +69,8 @@ Cowork Bridge **réduit** ton espace utilisé si tu étais en mode « Dupliquer 
 | « Aucun dossier Google Drive détecté » | Google Drive pour ordinateur n'est pas lancé, pas connecté à ton compte, ou pas en mode « Accéder en ligne aux fichiers ». Corrige, puis rouvre Cowork Bridge. |
 | « FreeFileSync n'est pas détecté » | Installe FreeFileSync (lien ci-dessus), puis rouvre Cowork Bridge. |
 | Cowork affiche un dossier vide | Tu as connecté le dossier Google Drive au lieu du **dossier de travail** (`CoworkWork`). Connecte `CoworkWork`. |
-| Synchro en temps réel absente | Rouvre Cowork Bridge et relance l'installation (elle reconfigure la synchronisation). |
+| **Session « vierge » au redémarrage / disque C: plein** | Le disque a été saturé → Windows ouvre un profil temporaire. **Ne rien enregistrer dans cette session** (tout y est effacé à la déconnexion ; tes vrais fichiers sont intacts). Libère de l'espace en **supprimant `C:\Users\<toi>\CoworkWork`** (ce sont des copies, tout est dans Drive), puis **redémarre**. (L'outil empêche normalement ça en refusant un dossier trop gros.) |
+| Pas de mise à jour automatique des fichiers | Rouvre Cowork Bridge → regarde le **minuteur**, ou clique **« Synchroniser maintenant »**. Si besoin, désynchronise puis ré-ajoute le dossier. |
 | Un conflit de fichier | FreeFileSync garde les deux versions et le signale. Bouton **« Ouvrir le dossier local »** → sous-dossier `_bridge` pour le détail. |
 
 Journal et configuration : bouton **« Ouvrir le dossier local »** → sous-dossier `_bridge` (pas besoin de taper un chemin).
