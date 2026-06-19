@@ -377,9 +377,11 @@ function Register-SyncTask {
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
                     -DontStopIfGoingOnBatteries -StartWhenAvailable `
                     -MultipleInstances IgnoreNew
+        # Pas de -User : enregistrer pour l'utilisateur courant (jeton interactif)
+        # passe sur un compte standard, là où -User déclenche souvent "Accès refusé".
         Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger `
             -Settings $settings -Description 'Cowork Bridge - synchro periodique Drive -> local' `
-            -User $env:USERNAME -RunLevel Limited | Out-Null
+            -RunLevel Limited | Out-Null
         return $true
     } catch {
         Write-Log "Tache planifiee non creee: $($_.Exception.Message)" 'WARN'
@@ -389,6 +391,60 @@ function Register-SyncTask {
 
 function Unregister-SyncTask {
     Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+# Fallback périodique SANS tâche planifiée (machines verrouillées qui refusent
+# Register-ScheduledTask) : une boucle résidente lancée au démarrage, qui
+# re-synchronise toutes les N min. Sans droits spéciaux (dossier Démarrage).
+function Set-SyncLoop {
+    param([string]$FfsExe, [string]$BatchPath, [int]$IntervalMin, [string]$MetaDir)
+    try {
+        $sec    = $IntervalMin * 60
+        $ffsLit = $FfsExe.Replace("'", "''")
+        $batLit = $BatchPath.Replace("'", "''")
+        $loopPs = Join-Path $MetaDir 'sync-loop.ps1'
+        $loopScript = @"
+# Cowork Bridge - boucle de synchro periodique (genere automatiquement, ne pas editer)
+`$ffs   = '$ffsLit'
+`$batch = '$batLit'
+while (`$true) {
+    try { Start-Process -FilePath `$ffs -ArgumentList ('"{0}"' -f `$batch) -WindowStyle Minimized -Wait } catch {}
+    Start-Sleep -Seconds $sec
+}
+"@
+        [System.IO.File]::WriteAllText($loopPs, $loopScript, (New-Object System.Text.UTF8Encoding($false)))
+
+        $ps  = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $args = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $loopPs
+        $startup = [Environment]::GetFolderPath('Startup')
+        $lnk = Join-Path $startup 'CoworkBridge-Sync.lnk'
+        $wsh = New-Object -ComObject WScript.Shell
+        $sc = $wsh.CreateShortcut($lnk)
+        $sc.TargetPath = $ps
+        $sc.Arguments  = $args
+        $sc.WindowStyle = 7
+        $sc.Description = 'Cowork Bridge - synchro periodique'
+        $sc.Save()
+
+        # démarrer la boucle tout de suite (sans attendre le prochain logon)
+        try { Start-Process -FilePath $ps -ArgumentList $args -WindowStyle Hidden | Out-Null } catch {}
+        Write-Log "Boucle de synchro periodique installee (toutes les $IntervalMin min, sans tache planifiee)."
+        return $true
+    } catch {
+        Write-Log "Boucle de synchro non installee: $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+}
+
+function Remove-SyncLoop {
+    $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge-Sync.lnk'
+    if (Test-Path $lnk) { Remove-Item $lnk -Force }
+    # arrêter la boucle résidente en cours (powershell qui exécute sync-loop.ps1)
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like '*sync-loop.ps1*' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch {}
 }
 
 # ----------------------------------------------------------------------------
@@ -460,7 +516,14 @@ function Invoke-Install {
 
     & $Status 'Installation de la synchronisation automatique...'
     $hasRts  = Set-StartupShortcut -RtsExe $Ffs.Rts -RealPath $realPath
+    # Pull régulier : tâche planifiée si la machine l'autorise, sinon boucle résidente
+    # (sans droits) -> dans tous les cas, une synchro complète toutes les N min.
     $hasTask = Register-SyncTask -FfsExe $Ffs.Exe -BatchPath $batchPath -IntervalMin $IntervalMin
+    Remove-SyncLoop   # repartir propre (évite tâche + boucle en double)
+    $hasLoop = $false
+    if (-not $hasTask) {
+        $hasLoop = Set-SyncLoop -FfsExe $Ffs.Exe -BatchPath $batchPath -IntervalMin $IntervalMin -MetaDir $meta
+    }
 
     Save-Config -Dest $Dest -Config ([pscustomobject]@{
         version   = 1
@@ -497,7 +560,28 @@ function Invoke-Install {
         try { Start-Process -FilePath $Ffs.Rts -ArgumentList ('"{0}"' -f $realPath) -WindowStyle Minimized | Out-Null } catch {}
     }
 
-    return [pscustomobject]@{ ExitCode = $proc.ExitCode; Rts = $hasRts; Task = $hasTask; Batch = $batchPath; Local = $watch.ToArray() }
+    return [pscustomobject]@{ ExitCode = $proc.ExitCode; Rts = $hasRts; Task = $hasTask; Loop = $hasLoop; Periodic = ($hasTask -or $hasLoop); Batch = $batchPath; Local = $watch.ToArray() }
+}
+
+# Sélecteur de dossier façon Explorateur (barre d'adresse + volet de navigation) :
+# OpenFileDialog détourné -> bien plus pratique que l'arborescence classique.
+# Le filtre n'affiche aucun fichier (extension bidon) -> on ne voit que les dossiers.
+# L'utilisateur ouvre le dossier voulu puis clique « Ouvrir » ; on prend ce dossier.
+function Select-DriveFolder {
+    param([string]$StartDir)
+    $ofd = New-Object System.Windows.Forms.OpenFileDialog
+    $ofd.Title           = 'Ouvre le dossier Google Drive à suivre, puis clique « Ouvrir »'
+    $ofd.ValidateNames   = $false
+    $ofd.CheckFileExists = $false
+    $ofd.CheckPathExists = $true
+    $ofd.Filter          = 'Dossier|*.cowork-bridge-none'
+    $ofd.FileName        = 'Sélectionner ce dossier'
+    if ($StartDir -and (Test-Path $StartDir)) { $ofd.InitialDirectory = $StartDir }
+    if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $dir = Split-Path -Path $ofd.FileName -Parent
+        if ($dir -and (Test-Path $dir)) { return $dir }
+    }
+    return $null
 }
 
 # ----------------------------------------------------------------------------
@@ -548,12 +632,9 @@ function Show-SelectionDialog {
     $btnBrowse.Size = New-Object System.Drawing.Size(230, 28)
     $form.Controls.Add($btnBrowse)
     $btnBrowse.Add_Click({
-        $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
-        $fbd.Description = 'Choisis un dossier (dans Google Drive) à rendre accessible à Cowork'
-        $fbd.ShowNewFolderButton = $false
-        if ($rows.Count -gt 0) { try { $fbd.SelectedPath = (Split-Path $rows[0].Path -Parent) } catch {} }
-        if ($fbd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            $p = $fbd.SelectedPath
+        $start = if ($rows.Count -gt 0) { try { Split-Path $rows[0].Path -Parent } catch { $null } } else { $null }
+        $p = Select-DriveFolder -StartDir $start
+        if ($p) {
             $found = $false
             for ($i = 0; $i -lt $rows.Count; $i++) {
                 if ($rows[$i].Path -eq $p) { $clb.SetItemChecked($i, $true); $found = $true; break }
@@ -657,11 +738,10 @@ function Show-ManageDialog {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "$script:AppName - Gestion"
-    $form.Size = New-Object System.Drawing.Size(560, 545)
+    $form.Size = New-Object System.Drawing.Size(560, 400)
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
-    $count = @($Config.sources).Count
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = "Cowork Bridge est actif." + [Environment]::NewLine +
                 "Dossier de travail : $($Config.dest)" + [Environment]::NewLine +
@@ -672,58 +752,44 @@ function Show-ManageDialog {
     $lbl.Size = New-Object System.Drawing.Size(510, 95)
     $form.Controls.Add($lbl)
 
-    $lblList = New-Object System.Windows.Forms.Label
-    $lblList.Text = "Dossiers suivis ($count) :"
-    $lblList.Location = New-Object System.Drawing.Point(20, 116); $lblList.Size = New-Object System.Drawing.Size(510, 18)
-    $form.Controls.Add($lblList)
-
-    $list = New-Object System.Windows.Forms.ListBox
-    $list.Location = New-Object System.Drawing.Point(20, 136); $list.Size = New-Object System.Drawing.Size(510, 118)
-    $list.IntegralHeight = $false; $list.HorizontalScrollbar = $true
-    foreach ($s in (@($Config.sources) | Sort-Object Type, Name)) {
-        $tag = if ($s.Type -eq 'Shared') { '[Partagé] ' } else { '[Mon Drive] ' }
-        [void]$list.Items.Add($tag + $s.Name)
-    }
-    $form.Controls.Add($list)
-
     $btnAdd = New-Object System.Windows.Forms.Button
     $btnAdd.Text = 'Ajouter un dossier'
-    $btnAdd.Location = New-Object System.Drawing.Point(20, 268); $btnAdd.Size = New-Object System.Drawing.Size(245, 34)
+    $btnAdd.Location = New-Object System.Drawing.Point(20, 124); $btnAdd.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnAdd)
 
     $btnSync = New-Object System.Windows.Forms.Button
     $btnSync.Text = 'Synchroniser maintenant'
-    $btnSync.Location = New-Object System.Drawing.Point(285, 268); $btnSync.Size = New-Object System.Drawing.Size(245, 34)
+    $btnSync.Location = New-Object System.Drawing.Point(285, 124); $btnSync.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnSync)
 
     $btnEdit = New-Object System.Windows.Forms.Button
     $btnEdit.Text = 'Modifier la sélection'
-    $btnEdit.Location = New-Object System.Drawing.Point(20, 310); $btnEdit.Size = New-Object System.Drawing.Size(245, 34)
+    $btnEdit.Location = New-Object System.Drawing.Point(20, 166); $btnEdit.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnEdit)
 
     $btnOpen = New-Object System.Windows.Forms.Button
     $btnOpen.Text = 'Ouvrir le dossier local'
-    $btnOpen.Location = New-Object System.Drawing.Point(285, 310); $btnOpen.Size = New-Object System.Drawing.Size(245, 34)
+    $btnOpen.Location = New-Object System.Drawing.Point(285, 166); $btnOpen.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnOpen)
 
     $btnUninstall = New-Object System.Windows.Forms.Button
     $btnUninstall.Text = 'Désinstaller Cowork Bridge'
-    $btnUninstall.Location = New-Object System.Drawing.Point(20, 352); $btnUninstall.Size = New-Object System.Drawing.Size(245, 34)
+    $btnUninstall.Location = New-Object System.Drawing.Point(20, 208); $btnUninstall.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnUninstall)
 
     $btnUpdate = New-Object System.Windows.Forms.Button
     $btnUpdate.Text = 'Vérifier les mises à jour'
-    $btnUpdate.Location = New-Object System.Drawing.Point(285, 352); $btnUpdate.Size = New-Object System.Drawing.Size(245, 34)
+    $btnUpdate.Location = New-Object System.Drawing.Point(285, 208); $btnUpdate.Size = New-Object System.Drawing.Size(245, 34)
     $form.Controls.Add($btnUpdate)
 
     $status = New-Object System.Windows.Forms.Label
-    $status.Location = New-Object System.Drawing.Point(20, 398); $status.Size = New-Object System.Drawing.Size(510, 50)
+    $status.Location = New-Object System.Drawing.Point(20, 252); $status.Size = New-Object System.Drawing.Size(510, 50)
     $status.ForeColor = [System.Drawing.Color]::DimGray
     $form.Controls.Add($status)
 
     $btnClose = New-Object System.Windows.Forms.Button
     $btnClose.Text = 'Fermer'
-    $btnClose.Location = New-Object System.Drawing.Point(440, 458); $btnClose.Size = New-Object System.Drawing.Size(90, 30)
+    $btnClose.Location = New-Object System.Drawing.Point(440, 312); $btnClose.Size = New-Object System.Drawing.Size(90, 30)
     $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $form.Controls.Add($btnClose)
 
@@ -891,13 +957,16 @@ function Start-Bridge {
                               -Ffs $ffs -FirstRun (-not $existing) -Status $statusCb
         $progress.Close()
 
-        $auto = if ($res.Rts -and $res.Task) {
+        $auto = if ($res.Rts -and $res.Periodic) {
             "La synchronisation tourne maintenant toute seule en arrière-plan :" + [Environment]::NewLine +
-            "  - tes modifications sont renvoyées vers Google Drive en temps réel ;" + [Environment]::NewLine +
-            "  - les changements venant de Drive sont récupérés dans ton dossier de travail toutes les $($choice.Interval) min."
+            "  - tes modifications partent vers Google Drive en temps réel ;" + [Environment]::NewLine +
+            "  - les changements venant de Drive sont récupérés toutes les $($choice.Interval) min."
+        } elseif ($res.Rts) {
+            "Tes modifications partent vers Google Drive en temps réel, et une synchro" + [Environment]::NewLine +
+            "complète a lieu à chaque démarrage de Windows. (Le rafraîchissement toutes les" + [Environment]::NewLine +
+            "$($choice.Interval) min n'a pas pu être installé sur cette machine.)"
         } else {
-            "La synchronisation automatique n'a pas pu être entièrement configurée." + [Environment]::NewLine +
-            "Reporte-toi au guide (dépannage, « Synchro en temps réel absente »)."
+            "La synchronisation automatique n'a pas pu être configurée. Voir le guide (dépannage)."
         }
 
         $msg = "Installation terminée." + [Environment]::NewLine + [Environment]::NewLine +
@@ -932,6 +1001,7 @@ function Invoke-Uninstall {
     } catch { Write-Log "Synchro avant desinstallation echouee: $($_.Exception.Message)" 'WARN' }
     Unregister-SyncTask
     Remove-StartupShortcut
+    Remove-SyncLoop
     try { Get-Process RealTimeSync -ErrorAction SilentlyContinue | Stop-Process -Force } catch {}
     Show-Info("Cowork Bridge est désinstallé (synchronisation automatique retirée)." + [Environment]::NewLine +
               "Ton dossier local est conservé : $($Config.dest)")
