@@ -1,12 +1,15 @@
 name: Build & release installer
 
-# Compile l'installeur Inno (.exe) sur un runner Windows et publie une Release
-# GitHub à CHAQUE push sur main. Version par date (YYYY.M.D.N), checksum SHA256.
-# L'app installée vérifie ensuite "releases/latest" et se met à jour seule.
+# Compile l'installeur Inno (.exe) sur un runner Windows.
+#  - push main : build + Release GitHub (version par date, checksum SHA256) -> auto-update.
+#  - pull_request : build + artefact téléchargeable SEULEMENT (aucune release) -> permet
+#    de tester un exe de PR sans l'expédier aux clients.
 # (Pas de signature ici : intégrité par checksum ; signature ajoutable plus tard.)
 
 on:
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
   workflow_dispatch:
 
@@ -79,7 +82,17 @@ jobs:
           "$h  CoworkBridge-Setup.exe" | Out-File -FilePath Output\CHECKSUM -Encoding ascii -NoNewline
           Write-Host "SHA256: $h"
 
+      - name: Upload artifact (test build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoworkBridge-Setup-${{ steps.ver.outputs.version }}
+          path: |
+            Output/CoworkBridge-Setup.exe
+            Output/CHECKSUM
+          if-no-files-found: error
+
       - name: Create or update release
+        if: github.event_name == 'push'   # release seulement sur push main, jamais sur PR
         shell: pwsh
         run: |
           $tag = "v${{ steps.ver.outputs.version }}"
