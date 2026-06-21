@@ -351,7 +351,12 @@ function Read-Pairs {
     `$dest = `$c.dest
     `$out = @()
     foreach (`$s in @(`$c.sources)) {
-        `$ln = if ((`$s.PSObject.Properties.Name -contains 'LocalName') -and `$s.LocalName) { [string]`$s.LocalName } else { [string]`$s.Name }
+        # tout garder sous StrictMode : une source malformee est ignoree, l'agent ne meurt pas
+        if (-not (`$s.PSObject.Properties.Name -contains 'Path') -or -not `$s.Path) { continue }
+        `$ln = `$null
+        if ((`$s.PSObject.Properties.Name -contains 'LocalName') -and `$s.LocalName) { `$ln = [string]`$s.LocalName }
+        elseif ((`$s.PSObject.Properties.Name -contains 'Name') -and `$s.Name) { `$ln = [string]`$s.Name }
+        if (-not `$ln) { continue }
         `$ln = `$ln -replace '[\\/:*?"<>|]', '_'
         `$out += [pscustomobject]@{ Drive = `$s.Path; Local = (Join-Path `$dest `$ln); Name = `$ln }
     }
@@ -414,9 +419,9 @@ while (`$true) {
     `$interval = Get-Interval
     `$due = ((Get-Date) - `$lastRun).TotalMinutes -ge `$interval
     if (`$dirty -or `$due) {
-        `$lastRun = Get-Date
         Run-All
-        try { [System.IO.File]::WriteAllText((Join-Path `$meta 'next-sync'), (Get-Date).AddMinutes(`$interval).ToString('o')) } catch {}
+        `$lastRun = Get-Date   # APRES Run-All : garantit un temps mort = intervalle, même si la synchro est longue
+        try { [System.IO.File]::WriteAllText((Join-Path `$meta 'next-sync'), `$lastRun.AddMinutes(`$interval).ToString('o')) } catch {}
     }
 }
 "@
