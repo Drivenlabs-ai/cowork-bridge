@@ -37,6 +37,25 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Version: $V"
 
+      - name: Bundle rclone (MIT, checksum vérifié)
+        shell: pwsh
+        run: |
+          $ver  = '1.74.3'                       # version épinglée (auditée)
+          $zip  = "rclone-v$ver-windows-amd64.zip"
+          $base = "https://downloads.rclone.org/v$ver"
+          Invoke-WebRequest "$base/$zip" -OutFile $zip -UseBasicParsing
+          Invoke-WebRequest "$base/SHA256SUMS" -OutFile rclone-SHA256SUMS -UseBasicParsing
+          $line = Select-String -Path rclone-SHA256SUMS -SimpleMatch $zip | Select-Object -First 1
+          if (-not $line) { throw "Hash introuvable pour $zip dans SHA256SUMS" }
+          $expected = ($line.Line -split '\s+')[0].ToLower()
+          $actual   = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($expected -ne $actual) { throw "Checksum rclone invalide: $actual != $expected" }
+          Expand-Archive $zip -DestinationPath rclone-extract -Force
+          Copy-Item (Get-ChildItem rclone-extract -Recurse -Filter rclone.exe | Select-Object -First 1).FullName -Destination rclone.exe -Force
+          $lic = Get-ChildItem rclone-extract -Recurse -Include 'LICENSE*','COPYING*' | Select-Object -First 1
+          if ($lic) { Copy-Item $lic.FullName -Destination rclone-LICENSE.txt -Force }
+          Write-Host "rclone $ver bundlé (checksum OK: $actual)"
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --version=6.7.1 -y --no-progress

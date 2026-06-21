@@ -16,8 +16,9 @@ Cloud Google  →  Google Drive (sur ton PC)  →  dossier de travail  →  Clau
 
 ## Prérequis (une fois)
 
-1. **Google Drive pour ordinateur** installé, connecté à ton compte, et réglé sur **« Accéder en ligne aux fichiers »** (Paramètres → Préférences → Dossiers de Drive → Options de synchronisation de Mon Drive). Ce mode laisse le reste de ton Drive dans le cloud (≈ aucun espace pris sur le PC) ; seuls les dossiers que tu choisis sont réellement téléchargés.
-2. **FreeFileSync** installé : https://freefilesync.org/download.php (gratuit). C'est le moteur qui copie les fichiers.
+**Un seul prérequis : Google Drive pour ordinateur** installé, connecté à ton compte, et réglé sur **« Accéder en ligne aux fichiers »** (Paramètres → Préférences → Dossiers de Drive → Options de synchronisation de Mon Drive). Ce mode laisse le reste de ton Drive dans le cloud (≈ aucun espace pris sur le PC) ; seuls les dossiers que tu choisis sont réellement téléchargés.
+
+Le moteur de synchronisation est **inclus dans l'installeur** — rien d'autre à installer à la main.
 
 ## Installation
 
@@ -33,7 +34,7 @@ C'est fini. Tes fichiers apparaissent dans Cowork.
 
 Rien à faire, la synchronisation tourne en arrière-plan :
 
-- **Tes modifications dans Cowork** → renvoyées vers Google Drive **en temps réel** (un petit programme nommé RealTimeSync tourne en fond, visible en bas à droite dans la zone de notification).
+- **Tes modifications dans Cowork** → renvoyées vers Google Drive **quasi instantanément** (un agent de synchronisation tourne en fond et réagit à chaque modification).
 - **Les changements venant de Drive** (toi sur un autre appareil, un collègue sur un Drive partagé) → récupérés dans ton dossier de travail **toutes les 30 min** par défaut (réglable).
 - Les suppressions passent par la **corbeille** (Windows + corbeille Drive), jamais en dur → toujours récupérables.
 
@@ -67,11 +68,10 @@ Cowork Bridge **réduit** ton espace utilisé si tu étais en mode « Dupliquer 
 | Symptôme | Cause / solution |
 |---|---|
 | « Aucun dossier Google Drive détecté » | Google Drive pour ordinateur n'est pas lancé, pas connecté à ton compte, ou pas en mode « Accéder en ligne aux fichiers ». Corrige, puis rouvre Cowork Bridge. |
-| « FreeFileSync n'est pas détecté » | Installe FreeFileSync (lien ci-dessus), puis rouvre Cowork Bridge. |
 | Cowork affiche un dossier vide | Tu as connecté le dossier Google Drive au lieu du **dossier de travail** (`CoworkWork`). Connecte `CoworkWork`. |
 | **Session « vierge » au redémarrage / disque C: plein** | Le disque a été saturé → Windows ouvre un profil temporaire. **Ne rien enregistrer dans cette session** (tout y est effacé à la déconnexion ; tes vrais fichiers sont intacts). Libère de l'espace en **supprimant `C:\Users\<toi>\CoworkWork`** (ce sont des copies, tout est dans Drive), puis **redémarre**. (L'outil empêche normalement ça en refusant un dossier trop gros.) |
 | Pas de mise à jour automatique des fichiers | Rouvre Cowork Bridge → regarde le **minuteur**, ou clique **« Synchroniser maintenant »**. Si besoin, désynchronise puis ré-ajoute le dossier. |
-| Un conflit de fichier | FreeFileSync garde les deux versions et le signale. Bouton **« Ouvrir le dossier local »** → sous-dossier `_bridge` pour le détail. |
+| Un conflit de fichier (modifié des deux côtés) | Les **deux versions sont conservées** (l'une renommée en `...conflict1`), rien n'est perdu. Bouton **« Ouvrir le dossier local »** → `_bridge\rclone.log` pour le détail. |
 
 Journal et configuration : bouton **« Ouvrir le dossier local »** → sous-dossier `_bridge` (pas besoin de taper un chemin).
 

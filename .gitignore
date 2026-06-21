@@ -2,6 +2,12 @@
 Output/
 *.exe
 
+# rclone bundlé : récupéré + vérifié par la CI, jamais committé
+rclone-extract/
+rclone-LICENSE.txt
+rclone-SHA256SUMS
+rclone-*.zip
+
 # Certificats / secrets de signature (ne JAMAIS committer)
 *.pfx
 *.p12

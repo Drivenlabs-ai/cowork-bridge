@@ -6,19 +6,26 @@
     filesystem virtuel de Drive ; on lui donne donc de vrais octets dans
     %USERPROFILE%\CoworkWork (dans le home, contrainte Cowork).
 
+    Moteur : rclone (bundlé, MIT) en mode bisync local <-> local, entre le dossier
+    monté par Google Drive pour ordinateur et le dossier de travail. Aucun OAuth,
+    aucun remote : ce sont deux chemins locaux.
+
     Synchro :
-      - RealTimeSync (démarrage) = push instantané des modifs locales.
-      - Boucle résidente (démarrage, _bridge\sync-loop.ps1) = pull périodique :
-        relit l'intervalle (_bridge\interval) à chaque tour, écrit l'heure de
-        prochaine synchro (_bridge\next-sync) pour le minuteur, et ne lance pas
-        FreeFileSync si une instance tourne déjà (verrou mono-instance).
-      - 1er run d'une nouvelle install = Miroir Drive -> local (jamais d'effacement
-        Drive). Suppressions = corbeille (récupérables).
+      - Agent résident (démarrage, _bridge\sync-agent.ps1) :
+          * FileSystemWatcher sur les dossiers locaux -> push quasi instantané ;
+          * timer toutes les N min -> pull régulier ;
+          * mono-instance (boucle mono-thread), relit config + intervalle à chaud,
+            écrit _bridge\next-sync pour le minuteur.
+      - 1er run d'une paire = rclone bisync --resync --resync-mode path1 (Drive fait
+        foi, union, jamais d'effacement Drive).
+      - Sûreté : --check-access (marqueur .coworkbridge-ok des deux côtés),
+        --max-delete 25, --conflict-resolve none (garde les 2 versions),
+        --backup-dir local daté (équivalent corbeille) + corbeille Drive native,
+        --resilient --recover --max-lock 2m.
 
     Sécurité disque : avant d'ajouter un dossier, on vérifie qu'il tient sur C:
     avec une marge (sinon remplir le profil empêche Windows de l'ouvrir).
 
-    Moteur : FreeFileSync (à installer au préalable).
     Lancer via Run-CoworkBridge.bat (-STA -ExecutionPolicy Bypass). UTF-8 AVEC BOM.
 #>
 
@@ -33,7 +40,8 @@ $script:AppName     = 'Cowork Bridge'
 $script:HomeRoot    = $env:USERPROFILE
 $script:DefaultDest = Join-Path $script:HomeRoot 'CoworkWork'
 $script:MetaDirName = '_bridge'
-$script:TaskName    = 'CoworkBridge-Sync'        # ancien mécanisme : nettoyé seulement
+$script:OldTaskName = 'CoworkBridge-Sync'        # ancien mécanisme : nettoyé seulement
+$script:MarkerName  = '.coworkbridge-ok'         # marqueur --check-access (anti côté vide)
 $script:DefaultInterval = 30
 $script:DiskMarginBytes = [long]5 * 1GB          # laisser au moins ça de libre sur C:
 $script:LogFile     = $null
@@ -64,8 +72,7 @@ function Write-Log {
 function Get-SyncResultText([int]$code) {
     switch ($code) {
         0       { 'Synchronisation terminée. Tout est à jour.' }
-        1       { 'Synchronisation terminée. Quelques fichiers ont été ignorés (verrouillés ou temporaires) — sans impact sur ton travail.' }
-        default { 'La synchronisation a rencontré un problème. Relance « Synchroniser maintenant ». Si le problème persiste, contacte ton interlocuteur Drivenlabs.' }
+        default { 'La synchronisation a rencontré un problème. Relance « Synchroniser maintenant ». Si ça persiste, ouvre le dossier local → _bridge\rclone.log, ou contacte ton interlocuteur Drivenlabs.' }
     }
 }
 
@@ -77,7 +84,6 @@ function Remove-ToRecycleBin([string]$Path) {
 }
 
 # Confinement : un chemin (rechargé depuis config) doit rester sous le home.
-# Re-vérifié à chaque opération destructive/création (pas seulement à l'install).
 function Test-UnderHome([string]$Path) {
     try {
         $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
@@ -87,8 +93,8 @@ function Test-UnderHome([string]$Path) {
     } catch { return $false }
 }
 
-# Rejette un chemin contenant un caractère qui n'a rien à faire dans un chemin
-# Windows (CR/LF, guillemet) -> bloque toute injection dans les configs/scripts générés.
+# Rejette un chemin contenant un caractère interdit (CR/LF, guillemet) -> bloque
+# toute injection dans les configs/scripts/commandes générés.
 function Assert-SafePath([string]$Path) {
     if ($null -eq $Path) { return }
     if ($Path -match '[\r\n"]') { throw "Chemin invalide (caractère interdit) : $Path" }
@@ -119,18 +125,10 @@ function Format-Size([long]$b) {
     return ('{0:N0} Ko' -f ($b / 1KB))
 }
 
-# Vrai si $NeededBytes tient sur le disque de $Dest en gardant la marge.
 function Test-DiskBudget([long]$NeededBytes, [string]$Dest) {
     $free = Get-FreeBytes $Dest
-    # free < 0 = espace libre indéterminé -> ne pas bloquer (un échec transitoire
-    # de lecture ne doit pas refuser tous les ajouts).
     $ok = if ($free -lt 0) { $true } else { (($NeededBytes + $script:DiskMarginBytes) -le $free) }
-    [pscustomobject]@{
-        Ok     = $ok
-        Free   = $free
-        Needed = $NeededBytes
-        Margin = $script:DiskMarginBytes
-    }
+    [pscustomobject]@{ Ok = $ok; Free = $free; Needed = $NeededBytes; Margin = $script:DiskMarginBytes }
 }
 
 # ----------------------------------------------------------------------------
@@ -227,218 +225,212 @@ function Get-DriveRoot {
     return $null
 }
 
-# Déduit le type (Mon Drive / Partagé) depuis le chemin.
 function Get-SourceType([string]$Path) {
     if ($Path -like '*\Shared drives\*' -or $Path -like '*\Drive partag*' -or $Path -like '*\Disques partag*') { return 'Shared' }
     return 'MyDrive'
 }
 
 # ----------------------------------------------------------------------------
-# Localisation de FreeFileSync
+# Localisation de rclone (bundlé à côté du script ; sinon PATH)
 # ----------------------------------------------------------------------------
-function Find-FreeFileSync {
-    $bases = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA) | Where-Object { $_ }
-    $candidates = New-Object System.Collections.Generic.List[string]
-    foreach ($b in $bases) {
-        $candidates.Add((Join-Path $b 'FreeFileSync'))
-        $candidates.Add((Join-Path $b 'Programs\FreeFileSync'))
-    }
-    $candidates = $candidates | Where-Object { Test-Path $_ } | Select-Object -Unique
-    foreach ($dir in $candidates) {
-        $exe = Join-Path $dir 'FreeFileSync.exe'
-        $rts = Join-Path $dir 'RealTimeSync.exe'
-        if (Test-Path $exe) {
-            $rtsPath = if (Test-Path $rts) { $rts } else { $null }
-            return [pscustomobject]@{ Exe = $exe; Rts = $rtsPath; Dir = $dir }
-        }
-    }
+function Find-Rclone {
+    $bundled = Join-Path $PSScriptRoot 'rclone.exe'
+    if (Test-Path $bundled) { return [pscustomobject]@{ Exe = $bundled } }
+    $cmd = Get-Command rclone.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return [pscustomobject]@{ Exe = $cmd.Source } }
     return $null
 }
 
 # ----------------------------------------------------------------------------
-# Generation des configs FreeFileSync
+# Moteur rclone : filtres, marqueur, commande bisync
 # ----------------------------------------------------------------------------
-function ConvertTo-XmlSafe([string]$s) {
-    if ($null -eq $s) { return '' }
-    $s = $s -replace '&', '&amp;'
-    $s = $s -replace '<', '&lt;'
-    $s = $s -replace '>', '&gt;'
-    $s = $s -replace '"', '&quot;'
-    $s = $s -replace "'", '&apos;'   # correct dans tout contexte XML (y compris attribut simple-quote)
-    return $s
-}
-
-# $Variant : 'TwoWay' (courant) | 'Mirror' (1er run Drive->local) | 'Update' (copie seule).
-# Élément log = <LogFolder/> à la racine (schéma FFS actuel vérifié, config.cpp) ;
-# <Variant> migré par FFS depuis le format 13.
-function New-FfsBatch {
-    param(
-        [object[]]$Pairs,
-        [string]$OutPath,
-        [ValidateSet('TwoWay','Mirror','Update')][string]$Variant = 'TwoWay'
+function New-FiltersFile([string]$Path) {
+    $lines = @(
+        '- *.tmp'
+        '- desktop.ini'
+        '- thumbs.db'
+        '- .tmp.drivedownload/'
+        '- .tmp.driveupload/'
+        ('- ' + $script:MarkerName)   # marqueur --check-access : présent des 2 côtés, jamais synchronisé
     )
-    foreach ($p in $Pairs) { Assert-SafePath $p.Left; Assert-SafePath $p.Right }
-    $pairBlocks = foreach ($p in $Pairs) {
-@"
-        <Pair>
-            <Left>$(ConvertTo-XmlSafe $p.Left)</Left>
-            <Right>$(ConvertTo-XmlSafe $p.Right)</Right>
-        </Pair>
-"@
-    }
-    $pairsXml = ($pairBlocks -join "`r`n")
-    $xml = @"
-<?xml version="1.0" encoding="utf-8"?>
-<FreeFileSync XmlType="BATCH" XmlFormat="13">
-    <Compare>
-        <Variant>TimeAndSize</Variant>
-        <Symlinks>Exclude</Symlinks>
-        <IgnoreTimeShift/>
-    </Compare>
-    <Synchronize>
-        <Variant>$Variant</Variant>
-        <DetectMovedFiles>false</DetectMovedFiles>
-        <DeletionPolicy>RecycleBin</DeletionPolicy>
-        <VersioningFolder Style="Replace"/>
-    </Synchronize>
-    <Filter>
-        <Include>
-            <Item>*</Item>
-        </Include>
-        <Exclude>
-            <Item>\System Volume Information\</Item>
-            <Item>\`$Recycle.Bin\</Item>
-            <Item>*\desktop.ini</Item>
-            <Item>*\thumbs.db</Item>
-            <Item>*\.tmp.drivedownload\</Item>
-            <Item>*\.tmp.driveupload\</Item>
-            <Item>*.tmp</Item>
-        </Exclude>
-        <TimeSpan Type="None">0</TimeSpan>
-        <SizeMin Unit="None">0</SizeMin>
-        <SizeMax Unit="None">0</SizeMax>
-    </Filter>
-    <FolderPairs>
-$pairsXml
-    </FolderPairs>
-    <Errors Ignore="true" Retry="2" Delay="5"/>
-    <PostSyncCommand Condition="Completion"/>
-    <LogFolder/>
-    <Batch>
-        <ProgressDialog Minimized="true" AutoClose="true"/>
-        <ErrorDialog>Show</ErrorDialog>
-        <PostSyncAction>None</PostSyncAction>
-    </Batch>
-</FreeFileSync>
-"@
-    [System.IO.File]::WriteAllText($OutPath, $xml, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($Path, ($lines -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
 
-function New-FfsReal {
-    param([string[]]$WatchDirs, [string]$FfsExe, [string]$BatchPath, [string]$OutPath)
-    Assert-SafePath $FfsExe; Assert-SafePath $BatchPath
-    foreach ($d in $WatchDirs) { Assert-SafePath $d }
-    $items = foreach ($d in $WatchDirs) { "    <Item>$(ConvertTo-XmlSafe $d)</Item>" }
-    $itemsXml = ($items -join "`r`n")
-    $cmd = ConvertTo-XmlSafe ('"{0}" "{1}"' -f $FfsExe, $BatchPath)
-    $xml = @"
-<?xml version="1.0" encoding="utf-8"?>
-<FreeFileSync XmlType="REAL" XmlFormat="2">
-  <Directories>
-$itemsXml
-  </Directories>
-  <Delay>30</Delay>
-  <Commandline>$cmd</Commandline>
-</FreeFileSync>
-"@
-    [System.IO.File]::WriteAllText($OutPath, $xml, (New-Object System.Text.UTF8Encoding($false)))
+# Marqueur d'accès (--check-access) : sa présence des deux côtés prouve que le dossier
+# est bien monté/hydraté. S'il manque (Drive non monté, dossier vu vide), bisync abort.
+function Set-Marker([string]$Folder) {
+    try {
+        $f = Join-Path $Folder $script:MarkerName
+        if (-not (Test-Path $f)) {
+            [System.IO.File]::WriteAllText($f, "Cowork Bridge - marqueur d'acces, ne pas supprimer.", (New-Object System.Text.UTF8Encoding($false)))
+        }
+    } catch {}
+}
+
+# Construit la ligne d'arguments rclone bisync pour une paire (chemins entre guillemets ;
+# Assert-SafePath garantit qu'aucun chemin ne contient de guillemet -> pas d'évasion).
+function Get-BisyncArgLine {
+    param([string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$Resync)
+    Assert-SafePath $DrivePath; Assert-SafePath $LocalPath; Assert-SafePath $MetaDir
+    $workdir = Join-Path $MetaDir 'bisync-state'
+    $filters = Join-Path $MetaDir 'filters.txt'
+    $backup  = Join-Path (Join-Path $MetaDir 'trash') ((Get-Date -Format 'yyyy-MM-dd') + '\' + $LocalName)
+    $log     = Join-Path $MetaDir 'rclone.log'
+    $q = { param($s) '"{0}"' -f $s }
+    $parts = @(
+        'bisync', (& $q $DrivePath), (& $q $LocalPath),
+        '--workdir', (& $q $workdir),
+        '--filters-file', (& $q $filters),
+        '--check-access', '--check-filename', $script:MarkerName,
+        '--max-delete', '25',
+        '--conflict-resolve', 'none',
+        '--backup-dir2', (& $q $backup),
+        '--resilient', '--recover', '--max-lock', '2m',
+        '--log-file', (& $q $log), '--log-level', 'INFO'
+    )
+    if ($Resync) { $parts += @('--resync', '--resync-mode', 'path1') }
+    return ($parts -join ' ')
+}
+
+# Lance une synchro bisync sur une paire. Retourne le code de sortie rclone (0 = ok).
+function Invoke-Bisync {
+    param([string]$RcloneExe, [string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$Resync)
+    $argLine = Get-BisyncArgLine -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $Resync
+    $p = Start-Process -FilePath $RcloneExe -ArgumentList $argLine -WindowStyle Hidden -PassThru -Wait
+    Write-Log "bisync '$LocalName' (resync=$Resync) code $($p.ExitCode)"
+    return [int]$p.ExitCode
 }
 
 # ----------------------------------------------------------------------------
-# Autostart : RealTimeSync (push instantané) + boucle résidente (pull périodique)
+# Agent résident : watcher (push instantané) + timer (pull périodique)
 # ----------------------------------------------------------------------------
-function Set-StartupShortcut {
-    param([string]$RtsExe, [string]$RealPath)
-    if (-not $RtsExe) { return $false }
-    $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge.lnk'
-    $wsh = New-Object -ComObject WScript.Shell
-    $sc = $wsh.CreateShortcut($lnk)
-    $sc.TargetPath = $RtsExe
-    $sc.Arguments  = '"{0}"' -f $RealPath
-    $sc.WindowStyle = 7
-    $sc.Description = 'Cowork Bridge - synchro temps reel'
-    $sc.Save()
-    return $true
-}
-
-function Remove-StartupShortcut {
-    $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge.lnk'
-    if (Test-Path $lnk) { Remove-Item $lnk -Force }
-}
-
 function Set-IntervalFile([string]$MetaDir, [int]$IntervalMin) {
     [System.IO.File]::WriteAllText((Join-Path $MetaDir 'interval'), [string]$IntervalMin, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-# Boucle résidente : relit l'intervalle à chaud, écrit l'heure de prochaine synchro,
-# verrou mono-instance (ne double pas avec RealTimeSync). Sans droits (dossier Démarrage).
-function Set-SyncLoop {
-    param([string]$FfsExe, [string]$BatchPath, [string]$MetaDir, [int]$IntervalMin)
+function Set-SyncAgent {
+    param([string]$RcloneExe, [string]$MetaDir, [int]$IntervalMin)
     try {
-        # un CR/LF dans un de ces chemins romprait le littéral PS et injecterait du code
-        Assert-SafePath $FfsExe; Assert-SafePath $BatchPath; Assert-SafePath $MetaDir
+        Assert-SafePath $RcloneExe; Assert-SafePath $MetaDir
         Set-IntervalFile -MetaDir $MetaDir -IntervalMin $IntervalMin
-        $ffsLit  = $FfsExe.Replace("'", "''")
-        $batLit  = $BatchPath.Replace("'", "''")
+        $rcLit   = $RcloneExe.Replace("'", "''")
         $metaLit = $MetaDir.Replace("'", "''")
-        $loopPs  = Join-Path $MetaDir 'sync-loop.ps1'
-        $loopScript = @"
-# Cowork Bridge - boucle de synchro periodique (genere automatiquement, ne pas editer)
-`$ffs   = '$ffsLit'
-`$batch = '$batLit'
-`$meta  = '$metaLit'
-while (`$true) {
-    if (-not (Get-Process FreeFileSync -ErrorAction SilentlyContinue)) {
-        try { Start-Process -FilePath `$ffs -ArgumentList ('"{0}"' -f `$batch) -WindowStyle Minimized -Wait } catch {}
+        $markLit = $script:MarkerName.Replace("'", "''")
+        $agentPs = Join-Path $MetaDir 'sync-agent.ps1'
+        $agent = @"
+# Cowork Bridge - agent de synchro (genere automatiquement, ne pas editer)
+Set-StrictMode -Version Latest
+`$rclone = '$rcLit'
+`$meta   = '$metaLit'
+`$marker = '$markLit'
+
+function Read-Pairs {
+    `$cfg = Join-Path `$meta 'config.json'
+    if (-not (Test-Path `$cfg)) { return @() }
+    try { `$c = Get-Content `$cfg -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return @() }
+    if (-not (`$c.PSObject.Properties.Name -contains 'sources') -or -not `$c.sources) { return @() }
+    `$dest = `$c.dest
+    `$out = @()
+    foreach (`$s in @(`$c.sources)) {
+        `$ln = if ((`$s.PSObject.Properties.Name -contains 'LocalName') -and `$s.LocalName) { [string]`$s.LocalName } else { [string]`$s.Name }
+        `$ln = `$ln -replace '[\\/:*?"<>|]', '_'
+        `$out += [pscustomobject]@{ Drive = `$s.Path; Local = (Join-Path `$dest `$ln); Name = `$ln }
     }
+    return `$out
+}
+
+function Get-Interval {
     `$min = 30
     try { `$min = [int]((Get-Content (Join-Path `$meta 'interval') -Raw).Trim()) } catch {}
     if (`$min -lt 1) { `$min = 1 }
-    try { [System.IO.File]::WriteAllText((Join-Path `$meta 'next-sync'), (Get-Date).AddMinutes(`$min).ToString('o')) } catch {}
-    Start-Sleep -Seconds (`$min * 60)
+    return `$min
+}
+
+function Run-All {
+    foreach (`$p in (Read-Pairs)) {
+        if (-not (Test-Path `$p.Local)) { continue }
+        `$workdir = Join-Path `$meta 'bisync-state'
+        `$filters = Join-Path `$meta 'filters.txt'
+        `$backup  = Join-Path (Join-Path `$meta 'trash') ((Get-Date -Format 'yyyy-MM-dd') + '\' + `$p.Name)
+        `$log     = Join-Path `$meta 'rclone.log'
+        `$args = @('bisync', ('"{0}"' -f `$p.Drive), ('"{0}"' -f `$p.Local),
+            '--workdir', ('"{0}"' -f `$workdir), '--filters-file', ('"{0}"' -f `$filters),
+            '--check-access', '--check-filename', `$marker, '--max-delete', '25',
+            '--conflict-resolve', 'none', '--backup-dir2', ('"{0}"' -f `$backup),
+            '--resilient', '--recover', '--max-lock', '2m',
+            '--log-file', ('"{0}"' -f `$log), '--log-level', 'INFO') -join ' '
+        try { Start-Process -FilePath `$rclone -ArgumentList `$args -WindowStyle Hidden -Wait } catch {}
+    }
+}
+
+# Watcher : chaque modif locale émet un événement dans la file (récupéré par Wait-Event).
+`$watchers = @()
+foreach (`$p in (Read-Pairs)) {
+    if (-not (Test-Path `$p.Local)) { continue }
+    try {
+        `$w = New-Object System.IO.FileSystemWatcher `$p.Local
+        `$w.IncludeSubdirectories = `$true
+        `$w.EnableRaisingEvents = `$true
+        foreach (`$ev in 'Changed','Created','Deleted','Renamed') {
+            Register-ObjectEvent -InputObject `$w -EventName `$ev | Out-Null
+        }
+        `$watchers += `$w
+    } catch {}
+}
+
+`$lastRun = (Get-Date).AddYears(-1)
+while (`$true) {
+    # Wait-Event pompe la file d'événements : push quasi instantané sur modif locale,
+    # et le timeout de 5 s sert aussi de tick pour le pull périodique.
+    `$ev = Wait-Event -Timeout 5
+    `$dirty = `$false
+    if (`$ev) { Get-Event | Remove-Event -ErrorAction SilentlyContinue; `$dirty = `$true }
+    `$interval = Get-Interval
+    `$due = ((Get-Date) - `$lastRun).TotalMinutes -ge `$interval
+    if (`$dirty -or `$due) {
+        `$lastRun = Get-Date
+        Run-All
+        try { [System.IO.File]::WriteAllText((Join-Path `$meta 'next-sync'), (Get-Date).AddMinutes(`$interval).ToString('o')) } catch {}
+    }
 }
 "@
-        [System.IO.File]::WriteAllText($loopPs, $loopScript, (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText($agentPs, $agent, (New-Object System.Text.UTF8Encoding($false)))
         $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $argLine = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $loopPs
+        $argLine = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $agentPs
         $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge-Sync.lnk'
         $wsh = New-Object -ComObject WScript.Shell
         $sc = $wsh.CreateShortcut($lnk)
-        $sc.TargetPath = $ps
-        $sc.Arguments  = $argLine
+        $sc.TargetPath  = $ps
+        $sc.Arguments   = $argLine
         $sc.WindowStyle = 7
-        $sc.Description = 'Cowork Bridge - synchro periodique'
+        $sc.Description  = 'Cowork Bridge - agent de synchro'
         $sc.Save()
         try { Start-Process -FilePath $ps -ArgumentList $argLine -WindowStyle Hidden | Out-Null } catch {}
         return $true
     } catch {
-        Write-Log "Boucle de synchro non installee: $($_.Exception.Message)" 'WARN'
+        Write-Log "Agent de synchro non installe: $($_.Exception.Message)" 'WARN'
         return $false
     }
 }
 
-function Remove-SyncLoop {
+function Remove-SyncAgent {
     $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge-Sync.lnk'
     if (Test-Path $lnk) { Remove-Item $lnk -Force }
-    try {
-        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and $_.CommandLine -like '*sync-loop.ps1*' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    } catch {}
+    foreach ($pat in @('*sync-agent.ps1*', '*sync-loop.ps1*')) {
+        try {
+            Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -and $_.CommandLine -like $pat } |
+                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        } catch {}
+    }
 }
 
-function Unregister-SyncTask {
-    Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
+# Nettoyage des anciens mécanismes (FreeFileSync / tâche planifiée / ancien raccourci RTS)
+function Remove-LegacyArtifacts {
+    try { Unregister-ScheduledTask -TaskName $script:OldTaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    $oldRts = Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge.lnk'
+    if (Test-Path $oldRts) { Remove-Item $oldRts -Force -ErrorAction SilentlyContinue }
+    try { Get-Process RealTimeSync -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
 }
 
 # ----------------------------------------------------------------------------
@@ -455,7 +447,6 @@ function Load-Config { param([string]$Dest)
     return $null
 }
 
-# Tri déterministe (Type, Name) -> noms locaux stables ; garde anti-collision.
 function Build-Pairs { param([object[]]$Selected, [string]$Dest)
     $pairs = New-Object System.Collections.Generic.List[object]
     $used  = New-Object System.Collections.Generic.HashSet[string]
@@ -463,8 +454,6 @@ function Build-Pairs { param([object[]]$Selected, [string]$Dest)
         $persisted = $null
         if (($s.PSObject.Properties.Name -contains 'LocalName') -and $s.LocalName) { $persisted = [string]$s.LocalName }
         if ($persisted) {
-            # honorer le nom local déjà sur disque (n'invente pas un nouveau dossier),
-            # mais toujours assaini (anti-traversal si la config a été altérée)
             $localName = ($persisted -replace '[\\/:*?"<>|]', '_')
             [void]$used.Add($localName.ToLowerInvariant())
         } else {
@@ -475,14 +464,11 @@ function Build-Pairs { param([object[]]$Selected, [string]$Dest)
             while (-not $used.Add($localName.ToLowerInvariant())) { $localName = "$base ($n)"; $n++ }
         }
         $localPath = Join-Path $Dest $localName
-        $pairs.Add([pscustomobject]@{ Source = $s; Left = $s.Path; Right = $localPath; LocalName = $localName })
+        $pairs.Add([pscustomobject]@{ Source = $s; Drive = $s.Path; Local = $localPath; LocalName = $localName })
     }
     return $pairs
 }
 
-# Nom local d'une source enregistrée (LocalName persisté, sinon recalcul).
-# Toujours assaini : sans séparateur ni caractère réservé -> ne peut pas remonter
-# hors du dossier de travail, même si la config a été altérée.
 function Resolve-LocalName([object]$Source) {
     $raw = $null
     if (($Source.PSObject.Properties.Name -contains 'LocalName') -and $Source.LocalName) {
@@ -495,8 +481,6 @@ function Resolve-LocalName([object]$Source) {
 }
 
 function Get-SortedSources([object]$Config) {
-    # StrictMode : ne jamais accéder à .sources sans vérifier qu'elle existe
-    # (un config.json antérieur à cette version peut ne pas la porter).
     if ($Config -and ($Config.PSObject.Properties.Name -contains 'sources') -and $Config.sources) {
         return @($Config.sources) | Sort-Object Type, Name
     }
@@ -509,7 +493,7 @@ function Get-SortedSources([object]$Config) {
 function Apply-Config {
     param(
         [object[]]$Selected, [string]$Dest, [int]$IntervalMin,
-        [object]$Ffs, [bool]$FirstRun, [scriptblock]$Status
+        [object]$Rclone, [bool]$FirstRun, [scriptblock]$Status
     )
     $say = { param($m) if ($Status) { & $Status $m } }
     if (-not (Test-UnderHome $Dest)) { throw "Dossier de travail hors du dossier utilisateur : $Dest" }
@@ -521,59 +505,47 @@ function Apply-Config {
     Write-Log "=== Application : $($Selected.Count) dossier(s), FirstRun=$FirstRun ==="
 
     $pairs = Build-Pairs -Selected $Selected -Dest $Dest
-    $watch = New-Object System.Collections.Generic.List[string]
     foreach ($p in $pairs) {
-        if (-not (Test-Path $p.Right)) { New-Item -ItemType Directory -Path $p.Right -Force | Out-Null }
-        $watch.Add($p.Right)
-        Write-Log "Paire: $($p.Left)  <->  $($p.Right)"
+        if (-not (Test-Path $p.Local)) { New-Item -ItemType Directory -Path $p.Local -Force | Out-Null }
+        Set-Marker $p.Local    # marqueur --check-access côté local
+        Set-Marker $p.Drive    # et côté Drive (sa présence prouve que le dossier est monté)
+        Write-Log "Paire: $($p.Drive)  <->  $($p.Local)"
     }
-    $pairArray = $pairs | ForEach-Object { [pscustomobject]@{ Left = $_.Left; Right = $_.Right } }
 
     & $say 'Génération de la configuration...'
-    $batchPath = Join-Path $meta 'bridge.ffs_batch'
-    $realPath  = Join-Path $meta 'bridge.ffs_real'
-    New-FfsBatch -Pairs $pairArray -OutPath $batchPath -Variant 'TwoWay'
-    New-FfsReal  -WatchDirs $watch.ToArray() -FfsExe $Ffs.Exe -BatchPath $batchPath -OutPath $realPath
-
-    & $say 'Installation de la synchronisation automatique...'
-    $hasRts = Set-StartupShortcut -RtsExe $Ffs.Rts -RealPath $realPath
-    Unregister-SyncTask                 # nettoie un éventuel ancien mécanisme
-    Remove-SyncLoop                     # repart propre
-    $hasLoop = Set-SyncLoop -FfsExe $Ffs.Exe -BatchPath $batchPath -MetaDir $meta -IntervalMin $IntervalMin
+    New-FiltersFile (Join-Path $meta 'filters.txt')
 
     Save-Config -Dest $Dest -Config ([pscustomobject]@{
-        version   = 1
+        version   = 2
+        engine    = 'rclone'
         dest      = $Dest
         interval  = $IntervalMin
-        ffsExe    = $Ffs.Exe
-        ffsRts    = $Ffs.Rts
-        batch     = $batchPath
-        real      = $realPath
         sources   = @($pairs | ForEach-Object { @{ Type = $_.Source.Type; Name = $_.Source.Name; Path = $_.Source.Path; LocalName = $_.LocalName } })
         installed = (Get-Date -Format 's')
     })
 
     & $say 'Première synchronisation (peut prendre un moment sur un gros dossier)...'
-    if ($FirstRun) {
-        $firstPath = Join-Path $meta 'bridge-firstrun.ffs_batch'
-        New-FfsBatch -Pairs $pairArray -OutPath $firstPath -Variant 'Mirror'
-        Write-Log 'Premiere synchro (Miroir Drive -> local)'
-        $proc = Start-Process -FilePath $Ffs.Exe -ArgumentList ('"{0}"' -f $firstPath) -PassThru -Wait
-    } else {
-        Write-Log 'Synchro (deux-sens)'
-        $proc = Start-Process -FilePath $Ffs.Exe -ArgumentList ('"{0}"' -f $batchPath) -PassThru -Wait
+    # 1er run d'une paire (dossier d'état bisync absent) = --resync. Sinon bisync normal.
+    $stateDir = Join-Path $meta 'bisync-state'
+    $worst = 0
+    foreach ($p in $pairs) {
+        $isNew = $FirstRun -or -not (Test-Path $stateDir)
+        $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $p.Drive -LocalPath $p.Local -MetaDir $meta -LocalName $p.LocalName -Resync $isNew
+        if ($code -gt $worst) { $worst = $code }
     }
-    Write-Log "Synchro terminee, code $($proc.ExitCode)"
-    if ($hasRts) {
-        try { Start-Process -FilePath $Ffs.Rts -ArgumentList ('"{0}"' -f $realPath) -WindowStyle Minimized | Out-Null } catch {}
-    }
-    return [pscustomobject]@{ ExitCode = $proc.ExitCode; Rts = $hasRts; Loop = $hasLoop; Batch = $batchPath }
+
+    & $say 'Installation de la synchronisation automatique...'
+    Remove-LegacyArtifacts
+    Remove-SyncAgent
+    $hasAgent = Set-SyncAgent -RcloneExe $Rclone.Exe -MetaDir $meta -IntervalMin $IntervalMin
+
+    return [pscustomobject]@{ ExitCode = $worst; Agent = $hasAgent }
 }
 
 # Désynchroniser un dossier : remonte son contenu vers Drive (copie seule, sans
 # suppression), puis envoie la copie locale à la corbeille, puis régénère.
 function Remove-TrackedFolder {
-    param([object]$Config, [object]$Source, [object]$Ffs)
+    param([object]$Config, [object]$Source, [object]$Rclone)
     if (-not (Test-UnderHome $Config.dest)) {
         Show-Warn("Dossier de travail hors de ton dossier utilisateur — opération annulée par sécurité.")
         return $false
@@ -583,14 +555,16 @@ function Remove-TrackedFolder {
     $local = Join-Path $Config.dest (Resolve-LocalName $Source)
 
     if (Test-Path $local) {
-        $pushBatch = Join-Path $meta 'bridge-release.ffs_batch'
-        New-FfsBatch -Pairs @([pscustomobject]@{ Left = $local; Right = $Source.Path }) -OutPath $pushBatch -Variant 'Update'
+        Assert-SafePath $local; Assert-SafePath $Source.Path
+        # remontée copie-seule local -> Drive (jamais de suppression côté Drive)
+        $log = Join-Path $meta 'rclone.log'
+        $argLine = @('copy', ('"{0}"' -f $local), ('"{0}"' -f $Source.Path),
+            '--log-file', ('"{0}"' -f $log), '--log-level', 'INFO') -join ' '
         $pushed = $false
         try {
-            # exe re-résolu (Find-FreeFileSync), jamais le chemin stocké en config
-            $p = Start-Process -FilePath $Ffs.Exe -ArgumentList ('"{0}"' -f $pushBatch) -PassThru -Wait
-            $pushed = ([int]$p.ExitCode -le 1)
-            Write-Log "Désync : remontée Update local->Drive de '$($Source.Name)', code $($p.ExitCode)"
+            $p = Start-Process -FilePath $Rclone.Exe -ArgumentList $argLine -WindowStyle Hidden -PassThru -Wait
+            $pushed = ([int]$p.ExitCode -eq 0)
+            Write-Log "Désync : remontée copy local->Drive de '$($Source.Name)', code $($p.ExitCode)"
         } catch { Write-Log "Désync : remontée échouée: $($_.Exception.Message)" 'WARN' }
         if (-not $pushed) {
             Show-Warn("La remontée vers Google Drive n'a pas abouti. Par sécurité, la copie locale n'est PAS supprimée (aucune perte).")
@@ -601,17 +575,14 @@ function Remove-TrackedFolder {
 
     $remaining = @(Get-SortedSources $Config | Where-Object { $_.Path -ne $Source.Path })
     if ($remaining.Count -eq 0) {
-        # plus aucun dossier suivi : on retire la synchro de fond, on garde la config vide
-        Remove-StartupShortcut; Remove-SyncLoop; Unregister-SyncTask
-        try { Get-Process RealTimeSync -ErrorAction SilentlyContinue | Stop-Process -Force } catch {}
+        Remove-SyncAgent; Remove-LegacyArtifacts
         Save-Config -Dest $Config.dest -Config ([pscustomobject]@{
-            version = 1; dest = $Config.dest; interval = [int]$Config.interval
-            ffsExe = $Config.ffsExe; ffsRts = $Config.ffsRts
-            batch = $Config.batch; real = $Config.real; sources = @(); installed = (Get-Date -Format 's')
+            version = 2; engine = 'rclone'; dest = $Config.dest; interval = [int]$Config.interval
+            sources = @(); installed = (Get-Date -Format 's')
         })
         return $true
     }
-    Apply-Config -Selected $remaining -Dest $Config.dest -IntervalMin ([int]$Config.interval) -Ffs $Ffs -FirstRun $false -Status $null | Out-Null
+    Apply-Config -Selected $remaining -Dest $Config.dest -IntervalMin ([int]$Config.interval) -Rclone $Rclone -FirstRun $false -Status $null | Out-Null
     return $true
 }
 
@@ -635,8 +606,6 @@ function Select-DriveFolder {
     return $null
 }
 
-# Construit l'objet source d'un chemin parcouru (avec taille + contrôle disque).
-# Renvoie l'objet, ou $null si annulé / refusé pour cause d'espace.
 function New-BrowsedSource {
     param([string]$Path, [long]$AlreadyUsedBytes, [string]$Dest, [scriptblock]$Status)
     $say = { param($m) if ($Status) { & $Status $m } }
@@ -774,7 +743,7 @@ function Show-SelectionDialog {
 # GUI - panneau de gestion = centre de contrôle
 # ----------------------------------------------------------------------------
 function Show-ManageDialog {
-    param([object]$Config, [object]$Ffs)
+    param([object]$Config, [object]$Rclone)
 
     $script:mgConfig = $Config
     $form = New-Object System.Windows.Forms.Form
@@ -811,13 +780,11 @@ function Show-ManageDialog {
     }
     $reload.Invoke()
 
-    # ligne minuteur
     $lblTimer = New-Object System.Windows.Forms.Label
     $lblTimer.Location = New-Object System.Drawing.Point(20, 212); $lblTimer.Size = New-Object System.Drawing.Size(510, 18)
     $lblTimer.ForeColor = [System.Drawing.Color]::DimGray
     $form.Controls.Add($lblTimer)
 
-    # délai + appliquer
     $lblInt = New-Object System.Windows.Forms.Label
     $lblInt.Text = 'Synchroniser depuis Drive toutes les (min) :'
     $lblInt.Location = New-Object System.Drawing.Point(20, 238); $lblInt.Size = New-Object System.Drawing.Size(270, 22)
@@ -831,7 +798,6 @@ function Show-ManageDialog {
     $btnInt.Location = New-Object System.Drawing.Point(375, 235); $btnInt.Size = New-Object System.Drawing.Size(155, 26)
     $form.Controls.Add($btnInt)
 
-    # boutons actions (2 colonnes)
     $btnAdd = New-Object System.Windows.Forms.Button
     $btnAdd.Text = 'Ajouter un dossier'
     $btnAdd.Location = New-Object System.Drawing.Point(20, 272); $btnAdd.Size = New-Object System.Drawing.Size(245, 32)
@@ -870,7 +836,6 @@ function Show-ManageDialog {
     $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $form.Controls.Add($btnClose)
 
-    # minuteur live (lit _bridge\next-sync)
     $nextFile = Join-Path (Get-MetaDir $Config.dest) 'next-sync'
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 1000
@@ -904,15 +869,13 @@ function Show-ManageDialog {
         $p = Select-DriveFolder -StartDir $start
         if (-not $p) { return }
         if ($script:mgSources | Where-Object { $_.Path -eq $p }) { $busy.Invoke('Ce dossier est déjà suivi.'); return }
-        # les dossiers déjà suivis sont déjà sur le disque -> l'espace libre les reflète déjà ;
-        # on ne vérifie que le nouveau dossier.
         $busy.Invoke('Calcul de la taille...')
         $src = New-BrowsedSource -Path $p -AlreadyUsedBytes ([long]0) -Dest $script:mgConfig.dest -Status $busy
         if (-not $src) { $busy.Invoke(''); return }
         $busy.Invoke('Ajout et synchronisation...')
         $newSel = @($script:mgSources | ForEach-Object { [pscustomobject]@{ Type = $_.Type; Name = $_.Name; Path = $_.Path } }) + @([pscustomobject]@{ Type = $src.Type; Name = $src.Name; Path = $src.Path })
         try {
-            $res = Apply-Config -Selected $newSel -Dest $script:mgConfig.dest -IntervalMin ([int]$script:mgConfig.interval) -Ffs $Ffs -FirstRun $false -Status $null
+            $res = Apply-Config -Selected $newSel -Dest $script:mgConfig.dest -IntervalMin ([int]$script:mgConfig.interval) -Rclone $Rclone -FirstRun $false -Status $null
             $reload.Invoke()
             $busy.Invoke((Get-SyncResultText ([int]$res.ExitCode)))
         } catch { $busy.Invoke("L'ajout a échoué : $($_.Exception.Message)") }
@@ -927,7 +890,7 @@ function Show-ManageDialog {
         if (-not (Confirm-YesNo $m)) { return }
         $busy.Invoke('Remontée vers Drive puis libération...')
         try {
-            if (Remove-TrackedFolder -Config $script:mgConfig -Source $src -Ffs $Ffs) {
+            if (Remove-TrackedFolder -Config $script:mgConfig -Source $src -Rclone $Rclone) {
                 $reload.Invoke(); $busy.Invoke("« $($src.Name) » n'est plus synchronisé.")
             }
         } catch { $busy.Invoke("La désynchronisation a échoué : $($_.Exception.Message)") }
@@ -935,10 +898,14 @@ function Show-ManageDialog {
     $btnSync.Add_Click({
         $busy.Invoke('Synchronisation en cours...')
         try {
-            # exe re-résolu + batch canonique (jamais les chemins stockés en config)
-            $batch = Join-Path (Get-MetaDir $script:mgConfig.dest) 'bridge.ffs_batch'
-            $p = Start-Process -FilePath $Ffs.Exe -ArgumentList ('"{0}"' -f $batch) -PassThru -Wait
-            $busy.Invoke((Get-SyncResultText ([int]$p.ExitCode)))
+            $worst = 0
+            foreach ($s in $script:mgSources) {
+                $local = Join-Path $script:mgConfig.dest (Resolve-LocalName $s)
+                if (-not (Test-Path $local)) { continue }
+                $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $s.Path -LocalPath $local -MetaDir (Get-MetaDir $script:mgConfig.dest) -LocalName (Resolve-LocalName $s) -Resync $false
+                if ($code -gt $worst) { $worst = $code }
+            }
+            $busy.Invoke((Get-SyncResultText $worst))
         } catch { $busy.Invoke("La synchronisation n'a pas pu démarrer : $($_.Exception.Message)") }
     })
     $btnOpen.Add_Click({ Start-Process explorer.exe -ArgumentList ('"{0}"' -f $script:mgConfig.dest) })
@@ -958,20 +925,17 @@ function Confirm-YesNo($msg) { return ([System.Windows.Forms.MessageBox]::Show($
 function Start-Bridge {
     if (Invoke-UpdateCheck) { return }
 
-    $ffs = Find-FreeFileSync
-    if (-not $ffs) {
-        $m = "Cowork Bridge a besoin d'un logiciel gratuit, FreeFileSync, pour copier tes fichiers." + [Environment]::NewLine +
-             "Il n'est pas encore installé sur cet ordinateur." + [Environment]::NewLine + [Environment]::NewLine +
-             "Ouvrir la page de téléchargement maintenant ?" + [Environment]::NewLine +
-             "Installe FreeFileSync, puis rouvre Cowork Bridge."
-        if (Confirm-YesNo $m) { Start-Process 'https://freefilesync.org/download.php' }
+    $rclone = Find-Rclone
+    if (-not $rclone) {
+        Show-Warn("Le moteur de synchronisation (rclone) est introuvable à côté de l'application." + [Environment]::NewLine +
+                  "Réinstalle Cowork Bridge depuis l'installeur officiel.")
         return
     }
 
-    # Installation existante -> centre de contrôle (gère tout en place)
+    # Installation existante -> centre de contrôle
     $existing = Load-Config -Dest $script:DefaultDest
     if ($existing -and @(Get-SortedSources $existing).Count -gt 0) {
-        Show-ManageDialog -Config $existing -Ffs $ffs
+        Show-ManageDialog -Config $existing -Rclone $rclone
         return
     }
 
@@ -997,15 +961,14 @@ function Start-Bridge {
     $statusCb = { param($m) $pl.Text = $m; $progress.Refresh() }
 
     try {
-        $res = Apply-Config -Selected $choice.Selected -Dest $choice.Dest -IntervalMin $choice.Interval -Ffs $ffs -FirstRun $true -Status $statusCb
+        $res = Apply-Config -Selected $choice.Selected -Dest $choice.Dest -IntervalMin $choice.Interval -Rclone $rclone -FirstRun $true -Status $statusCb
         $progress.Close()
-        $auto = if ($res.Rts -and $res.Loop) {
+        $auto = if ($res.Agent) {
             "La synchronisation tourne maintenant toute seule en arrière-plan :" + [Environment]::NewLine +
-            "  - tes modifications partent vers Google Drive en temps réel ;" + [Environment]::NewLine +
+            "  - tes modifications partent vers Google Drive quasi instantanément ;" + [Environment]::NewLine +
             "  - les changements venant de Drive sont récupérés toutes les $($choice.Interval) min."
         } else {
-            "Tes modifications partent vers Google Drive en temps réel." + [Environment]::NewLine +
-            "Le rafraîchissement périodique n'a pas pu être installé — voir le guide (dépannage)."
+            "La synchronisation automatique n'a pas pu être installée — voir le guide (dépannage)."
         }
         $msg = "Installation terminée." + [Environment]::NewLine + [Environment]::NewLine +
                "Dernière étape, dans Claude Cowork : connecte le dossier ci-dessous —" + [Environment]::NewLine +
@@ -1030,10 +993,8 @@ function Invoke-Uninstall {
          "(tu pourras l'effacer à la main pour récupérer l'espace). Aucun fichier n'est perdu."
     if (-not (Confirm-YesNo $m)) { return }
     $script:LogFile = Join-Path (Get-MetaDir $Config.dest) 'bridge.log'
-    Unregister-SyncTask
-    Remove-StartupShortcut
-    Remove-SyncLoop
-    try { Get-Process RealTimeSync -ErrorAction SilentlyContinue | Stop-Process -Force } catch {}
+    Remove-SyncAgent
+    Remove-LegacyArtifacts
     Show-Info("Cowork Bridge est désinstallé (synchronisation automatique retirée)." + [Environment]::NewLine +
               "Ton dossier local est conservé : $($Config.dest)")
 }
