@@ -52,8 +52,10 @@ jobs:
           if ($expected -ne $actual) { throw "Checksum rclone invalide: $actual != $expected" }
           Expand-Archive $zip -DestinationPath rclone-extract -Force
           Copy-Item (Get-ChildItem rclone-extract -Recurse -Filter rclone.exe | Select-Object -First 1).FullName -Destination rclone.exe -Force
-          $lic = Get-ChildItem rclone-extract -Recurse -Include 'LICENSE*','COPYING*' | Select-Object -First 1
-          if ($lic) { Copy-Item $lic.FullName -Destination rclone-LICENSE.txt -Force }
+          # Le zip rclone ne contient PAS la licence -> on récupère COPYING (MIT) depuis
+          # le repo au tag exact (obligation MIT : joindre la notice). Build cassé si absente.
+          Invoke-WebRequest "https://raw.githubusercontent.com/rclone/rclone/v$ver/COPYING" -OutFile rclone-LICENSE.txt -UseBasicParsing
+          if (-not (Test-Path rclone-LICENSE.txt)) { throw "Notice MIT rclone introuvable" }
           Write-Host "rclone $ver bundlé (checksum OK: $actual)"
 
       - name: Install Inno Setup

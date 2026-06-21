@@ -301,6 +301,20 @@ function Invoke-Bisync {
     return [int]$p.ExitCode
 }
 
+# Synchronise une paire en gérant sa baseline : --resync si la paire n'a jamais été
+# synchronisée (marqueur absent), sinon bisync normal. Marqueur posé après un run à 0.
+# Indispensable : une paire neuve SANS --resync fait sortir bisync en erreur.
+function Sync-Pair {
+    param([object]$Rclone, [string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$ForceResync)
+    $stateDir = Join-Path $MetaDir 'bisync-state'
+    if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
+    $pairState = Join-Path $stateDir ($LocalName + '.synced')
+    $resync = $ForceResync -or -not (Test-Path $pairState)
+    $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $resync
+    if ($code -eq 0) { New-Item -ItemType File -Path $pairState -Force | Out-Null }
+    return $code
+}
+
 # ----------------------------------------------------------------------------
 # Agent résident : watcher (push instantané) + timer (pull périodique)
 # ----------------------------------------------------------------------------
@@ -329,6 +343,7 @@ function Read-Pairs {
     if (-not (Test-Path `$cfg)) { return @() }
     try { `$c = Get-Content `$cfg -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return @() }
     if (-not (`$c.PSObject.Properties.Name -contains 'sources') -or -not `$c.sources) { return @() }
+    if (-not (`$c.PSObject.Properties.Name -contains 'dest') -or -not `$c.dest) { return @() }
     `$dest = `$c.dest
     `$out = @()
     foreach (`$s in @(`$c.sources)) {
@@ -347,19 +362,26 @@ function Get-Interval {
 }
 
 function Run-All {
+    `$stateDir = Join-Path `$meta 'bisync-state'
+    if (-not (Test-Path `$stateDir)) { New-Item -ItemType Directory -Path `$stateDir -Force | Out-Null }
     foreach (`$p in (Read-Pairs)) {
         if (-not (Test-Path `$p.Local)) { continue }
-        `$workdir = Join-Path `$meta 'bisync-state'
-        `$filters = Join-Path `$meta 'filters.txt'
-        `$backup  = Join-Path (Join-Path `$meta 'trash') ((Get-Date -Format 'yyyy-MM-dd') + '\' + `$p.Name)
-        `$log     = Join-Path `$meta 'rclone.log'
-        `$args = @('bisync', ('"{0}"' -f `$p.Drive), ('"{0}"' -f `$p.Local),
-            '--workdir', ('"{0}"' -f `$workdir), '--filters-file', ('"{0}"' -f `$filters),
+        `$filters   = Join-Path `$meta 'filters.txt'
+        `$backup    = Join-Path (Join-Path `$meta 'trash') ((Get-Date -Format 'yyyy-MM-dd') + '\' + `$p.Name)
+        `$log       = Join-Path `$meta 'rclone.log'
+        `$pairState = Join-Path `$stateDir (`$p.Name + '.synced')
+        `$argLine = @('bisync', ('"{0}"' -f `$p.Drive), ('"{0}"' -f `$p.Local),
+            '--workdir', ('"{0}"' -f `$stateDir), '--filters-file', ('"{0}"' -f `$filters),
             '--check-access', '--check-filename', `$marker, '--max-delete', '25',
             '--conflict-resolve', 'none', '--backup-dir2', ('"{0}"' -f `$backup),
             '--resilient', '--recover', '--max-lock', '2m',
-            '--log-file', ('"{0}"' -f `$log), '--log-level', 'INFO') -join ' '
-        try { Start-Process -FilePath `$rclone -ArgumentList `$args -WindowStyle Hidden -Wait } catch {}
+            '--log-file', ('"{0}"' -f `$log), '--log-level', 'INFO')
+        if (-not (Test-Path `$pairState)) { `$argLine += @('--resync', '--resync-mode', 'path1') }
+        `$argLine = `$argLine -join ' '
+        try {
+            `$proc = Start-Process -FilePath `$rclone -ArgumentList `$argLine -WindowStyle Hidden -Wait -PassThru
+            if (`$proc.ExitCode -eq 0) { New-Item -ItemType File -Path `$pairState -Force | Out-Null }
+        } catch {}
     }
 }
 
@@ -487,6 +509,19 @@ function Get-SortedSources([object]$Config) {
     return @()
 }
 
+# Garantit que dest/interval existent (config partielle ou éditée à la main) -> évite
+# les exceptions StrictMode sur les accès .dest/.interval dans le panneau et les opérations.
+function Normalize-Config([object]$Config) {
+    if (-not $Config) { return $null }
+    if (-not ($Config.PSObject.Properties.Name -contains 'dest') -or -not $Config.dest) {
+        $Config | Add-Member -NotePropertyName dest -NotePropertyValue $script:DefaultDest -Force
+    }
+    if (-not ($Config.PSObject.Properties.Name -contains 'interval') -or -not $Config.interval) {
+        $Config | Add-Member -NotePropertyName interval -NotePropertyValue $script:DefaultInterval -Force
+    }
+    return $Config
+}
+
 # ----------------------------------------------------------------------------
 # Application d'une configuration (install initiale, ajout, désync : factorisé)
 # ----------------------------------------------------------------------------
@@ -525,12 +560,11 @@ function Apply-Config {
     })
 
     & $say 'Première synchronisation (peut prendre un moment sur un gros dossier)...'
-    # 1er run d'une paire (dossier d'état bisync absent) = --resync. Sinon bisync normal.
-    $stateDir = Join-Path $meta 'bisync-state'
+    # Baseline gérée PAR PAIRE par Sync-Pair (un dossier ajouté plus tard a besoin de
+    # SON propre --resync, sinon bisync sort en erreur).
     $worst = 0
     foreach ($p in $pairs) {
-        $isNew = $FirstRun -or -not (Test-Path $stateDir)
-        $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $p.Drive -LocalPath $p.Local -MetaDir $meta -LocalName $p.LocalName -Resync $isNew
+        $code = Sync-Pair -Rclone $Rclone -DrivePath $p.Drive -LocalPath $p.Local -MetaDir $meta -LocalName $p.LocalName -ForceResync $FirstRun
         if ($code -gt $worst) { $worst = $code }
     }
 
@@ -546,6 +580,7 @@ function Apply-Config {
 # suppression), puis envoie la copie locale à la corbeille, puis régénère.
 function Remove-TrackedFolder {
     param([object]$Config, [object]$Source, [object]$Rclone)
+    $Config = Normalize-Config $Config
     if (-not (Test-UnderHome $Config.dest)) {
         Show-Warn("Dossier de travail hors de ton dossier utilisateur — opération annulée par sécurité.")
         return $false
@@ -745,6 +780,7 @@ function Show-SelectionDialog {
 function Show-ManageDialog {
     param([object]$Config, [object]$Rclone)
 
+    $Config = Normalize-Config $Config
     $script:mgConfig = $Config
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "$script:AppName - Gestion"
@@ -767,7 +803,8 @@ function Show-ManageDialog {
 
     $script:mgSources = @()
     $reload = {
-        $script:mgConfig = Load-Config -Dest $Config.dest
+        $reloaded = Load-Config -Dest $Config.dest
+        if ($reloaded) { $script:mgConfig = Normalize-Config $reloaded }
         $script:mgSources = @(Get-SortedSources $script:mgConfig)
         $list.Items.Clear()
         foreach ($s in $script:mgSources) {
@@ -902,7 +939,7 @@ function Show-ManageDialog {
             foreach ($s in $script:mgSources) {
                 $local = Join-Path $script:mgConfig.dest (Resolve-LocalName $s)
                 if (-not (Test-Path $local)) { continue }
-                $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $s.Path -LocalPath $local -MetaDir (Get-MetaDir $script:mgConfig.dest) -LocalName (Resolve-LocalName $s) -Resync $false
+                $code = Sync-Pair -Rclone $Rclone -DrivePath $s.Path -LocalPath $local -MetaDir (Get-MetaDir $script:mgConfig.dest) -LocalName (Resolve-LocalName $s) -ForceResync $false
                 if ($code -gt $worst) { $worst = $code }
             }
             $busy.Invoke((Get-SyncResultText $worst))
@@ -933,7 +970,7 @@ function Start-Bridge {
     }
 
     # Installation existante -> centre de contrôle
-    $existing = Load-Config -Dest $script:DefaultDest
+    $existing = Normalize-Config (Load-Config -Dest $script:DefaultDest)
     if ($existing -and @(Get-SortedSources $existing).Count -gt 0) {
         Show-ManageDialog -Config $existing -Rclone $rclone
         return

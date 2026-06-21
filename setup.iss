@@ -75,7 +75,7 @@ Source: "GUIDE.md";                 DestDir: "{app}"; Flags: ignoreversion isrea
 ; "Bundle rclone"), posé à côté du script. La notice MIT accompagne le binaire
 ; (obligation de la licence). Requis : un installeur sans moteur serait cassé.
 Source: "rclone.exe";               DestDir: "{app}"; Flags: ignoreversion
-Source: "rclone-LICENSE.txt";       DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "rclone-LICENSE.txt";       DestDir: "{app}"; Flags: ignoreversion
 ; VERSION : écrit par la CI (date-version) ; permet à l'app de connaître sa
 ; version installée pour la vérif de mise à jour. Absent en build local -> ignoré.
 Source: "VERSION";                  DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
