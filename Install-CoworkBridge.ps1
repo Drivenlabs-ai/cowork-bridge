@@ -86,10 +86,12 @@ function Remove-ToRecycleBin([string]$Path) {
 # Confinement : un chemin (rechargé depuis config) doit rester sous le home.
 function Test-UnderHome([string]$Path) {
     try {
-        $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
-        $home = [System.IO.Path]::GetFullPath($script:HomeRoot).TrimEnd('\')
-        return $full.Equals($home, [System.StringComparison]::OrdinalIgnoreCase) -or
-               $full.StartsWith($home + '\', [System.StringComparison]::OrdinalIgnoreCase)
+        # NB : ne pas nommer la variable $home -> c'est la variable automatique PowerShell
+        # ($HOME), et la collision faisait renvoyer False à tort (vérifié sur Windows).
+        $full     = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $homeFull = [System.IO.Path]::GetFullPath($script:HomeRoot).TrimEnd('\')
+        return $full.Equals($homeFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+               $full.StartsWith($homeFull + '\', [System.StringComparison]::OrdinalIgnoreCase)
     } catch { return $false }
 }
 
@@ -245,13 +247,15 @@ function Find-Rclone {
 # Moteur rclone : filtres, marqueur, commande bisync
 # ----------------------------------------------------------------------------
 function New-FiltersFile([string]$Path) {
+    # NE PAS exclure le marqueur .coworkbridge-ok : --check-access applique ces filtres
+    # et doit pouvoir le trouver des deux côtés. Il se synchronise donc (inerte, identique
+    # partout) — l'exclure faisait échouer --check-access systématiquement (vérifié sur Windows).
     $lines = @(
         '- *.tmp'
         '- desktop.ini'
         '- thumbs.db'
         '- .tmp.drivedownload/'
         '- .tmp.driveupload/'
-        ('- ' + $script:MarkerName)   # marqueur --check-access : présent des 2 côtés, jamais synchronisé
     )
     [System.IO.File]::WriteAllText($Path, ($lines -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
