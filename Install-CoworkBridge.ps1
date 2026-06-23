@@ -250,12 +250,20 @@ function New-FiltersFile([string]$Path) {
     # NE PAS exclure le marqueur .coworkbridge-ok : --check-access applique ces filtres
     # et doit pouvoir le trouver des deux côtés. Il se synchronise donc (inerte, identique
     # partout) — l'exclure faisait échouer --check-access systématiquement (vérifié sur Windows).
+    # Exclure les fichiers d'état FreeFileSync : volatils (réécrits en continu) ils font
+    # échouer rclone (« corrupted on transfer: sizes differ »). Indispensable pour migrer
+    # une ancienne install FFS sans casser la synchro/désync (vu sur la machine de Dylan).
     $lines = @(
         '- *.tmp'
         '- desktop.ini'
         '- thumbs.db'
         '- .tmp.drivedownload/'
         '- .tmp.driveupload/'
+        '- *.ffs_db'
+        '- sync.ffs_db*'
+        '- *.ffs_lock'
+        '- *.ffs_batch'
+        '- *.ffs_real'
     )
     [System.IO.File]::WriteAllText($Path, ($lines -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
@@ -602,7 +610,11 @@ function Remove-TrackedFolder {
         Assert-SafePath $local; Assert-SafePath $Source.Path
         # remontée copie-seule local -> Drive (jamais de suppression côté Drive)
         $log = Join-Path $meta 'rclone.log'
+        $filters = Join-Path $meta 'filters.txt'
+        if (-not (Test-Path $filters)) { New-FiltersFile $filters }
+        Assert-SafePath $filters
         $argLine = @('copy', ('"{0}"' -f $local), ('"{0}"' -f $Source.Path),
+            '--filters-file', ('"{0}"' -f $filters),
             '--log-file', ('"{0}"' -f $log), '--log-level', 'INFO') -join ' '
         $pushed = $false
         try {
@@ -627,6 +639,99 @@ function Remove-TrackedFolder {
         return $true
     }
     Apply-Config -Selected $remaining -Dest $Config.dest -IntervalMin ([int]$Config.interval) -Rclone $Rclone -FirstRun $false -Status $null | Out-Null
+    return $true
+}
+
+# ----------------------------------------------------------------------------
+# Migration d'une ancienne install FreeFileSync (config v1) vers le moteur rclone (v2).
+# Déclenchée au lancement : sans elle, un client FFS qui s'auto-update hérite de RealTimeSync
+# encore actif + des fichiers d'état .ffs_* volatils qui cassent rclone (cas réel : Dylan).
+# ----------------------------------------------------------------------------
+function Test-NeedsMigration([object]$Config) {
+    if (-not $Config) { return $false }
+    if (-not ($Config.PSObject.Properties.Name -contains 'engine')) { return $true }
+    return ($Config.engine -ne 'rclone')
+}
+
+# Supprime les fichiers d'état FreeFileSync côté local (+ _bridge). Ne touche JAMAIS au Drive
+# (les éventuels .ffs_db restés côté Drive sont simplement exclus par les filtres). RealTimeSync
+# doit avoir été arrêté avant (Remove-LegacyArtifacts), sinon il les régénère.
+function Remove-FfsArtifacts {
+    param([string]$Dest, [object[]]$Sources)
+    $meta = Get-MetaDir $Dest
+    foreach ($pat in @('*.ffs_batch', '*.ffs_real', '*.ffs_db', 'sync.ffs_db*', '*.ffs_lock')) {
+        try { Get-ChildItem -Path $meta -Filter $pat -Force -ErrorAction SilentlyContinue |
+                Where-Object { -not $_.PSIsContainer } | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    foreach ($s in $Sources) {
+        $local = Join-Path $Dest (Resolve-LocalName $s)
+        if (-not (Test-Path $local)) { continue }
+        foreach ($pat in @('*.ffs_db', 'sync.ffs_db*', '*.ffs_lock')) {
+            try { Get-ChildItem -Path $local -Filter $pat -Recurse -Force -ErrorAction SilentlyContinue |
+                    Where-Object { -not $_.PSIsContainer } | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+}
+
+# Sources legacy -> sources v2, dédupliquées par Path (premier gagné -> tue le doublon FFS).
+function Get-MigratedSources([object]$Config) {
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+    $out  = New-Object System.Collections.Generic.List[object]
+    foreach ($s in (Get-SortedSources $Config)) {
+        if (-not ($s.PSObject.Properties.Name -contains 'Path') -or -not $s.Path) { continue }
+        if (-not $seen.Add(([string]$s.Path).ToLowerInvariant())) { continue }
+        $type = if (($s.PSObject.Properties.Name -contains 'Type') -and $s.Type) { [string]$s.Type } else { Get-SourceType ([string]$s.Path) }
+        $name = if (($s.PSObject.Properties.Name -contains 'Name') -and $s.Name) { [string]$s.Name } else { Split-Path ([string]$s.Path) -Leaf }
+        $o = [pscustomobject]@{ Type = $type; Name = $name; Path = [string]$s.Path }
+        if (($s.PSObject.Properties.Name -contains 'LocalName') -and $s.LocalName) {
+            $o | Add-Member -NotePropertyName LocalName -NotePropertyValue ([string]$s.LocalName) -Force
+        }
+        $out.Add($o)
+    }
+    return $out.ToArray()
+}
+
+# Bascule complète FFS -> rclone : arrêt de l'ancien moteur, purge des fichiers d'état FFS,
+# puis ré-application en rclone (baseline --resync, filtres FFS-exclus, agent). Idempotente :
+# une fois la config en engine=rclone, Test-NeedsMigration renvoie $false.
+function Invoke-LegacyMigration {
+    param([object]$Config, [object]$Rclone, [scriptblock]$Status)
+    $say = { param($m) if ($Status) { & $Status $m } }
+    $Config = Normalize-Config $Config
+    $dest = $Config.dest
+    $meta = Get-MetaDir $dest
+    if (-not (Test-Path $meta)) { New-Item -ItemType Directory -Path $meta -Force | Out-Null }
+    $script:LogFile = Join-Path $meta 'bridge.log'
+    Write-Log "=== Migration FreeFileSync -> rclone ==="
+
+    if (-not (Test-UnderHome $dest)) {
+        Show-Warn("Dossier de travail hors de ton dossier utilisateur — migration annulée par sécurité.")
+        return $false
+    }
+
+    & $say 'Arrêt de l''ancien moteur de synchronisation...'
+    Remove-LegacyArtifacts   # stoppe RealTimeSync + retire tâche/raccourci FFS
+    Remove-SyncAgent
+
+    $sources = @(Get-MigratedSources $Config)   # @() : garde un tableau même à 0/1 élément
+    & $say 'Nettoyage des anciens fichiers de synchronisation...'
+    Remove-FfsArtifacts -Dest $dest -Sources $sources
+
+    if ($sources.Count -eq 0) {
+        New-FiltersFile (Join-Path $meta 'filters.txt')
+        Save-Config -Dest $dest -Config ([pscustomobject]@{
+            version = 2; engine = 'rclone'; dest = $dest; interval = [int]$Config.interval
+            sources = @(); installed = (Get-Date -Format 's')
+        })
+        Write-Log "Migration : aucune source exploitable, config v2 vide ecrite."
+        return $true
+    }
+
+    & $say 'Bascule vers le nouveau moteur (peut prendre un moment)...'
+    # Apply-Config réécrit config.json en v2, pose markers + filtres (FFS exclus), baseline
+    # --resync (local et Drive déjà alignés par FFS -> union quasi nulle), installe l'agent.
+    Apply-Config -Selected $sources -Dest $dest -IntervalMin ([int]$Config.interval) -Rclone $Rclone -FirstRun $true -Status $Status | Out-Null
+    Write-Log "Migration terminee : $($sources.Count) dossier(s) bascule(s) en rclone."
     return $true
 }
 
@@ -997,6 +1102,31 @@ function Start-Bridge {
 
     # Installation existante -> centre de contrôle
     $existing = Normalize-Config (Load-Config -Dest $script:DefaultDest)
+
+    # Ancienne install FreeFileSync (config v1) -> bascule transparente vers rclone.
+    if (Test-NeedsMigration $existing) {
+        $mig = New-Object System.Windows.Forms.Form
+        $mig.Text = "$script:AppName"; $mig.Size = New-Object System.Drawing.Size(480, 130)
+        $mig.StartPosition = 'CenterScreen'; $mig.ControlBox = $false
+        $mig.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+        $ml = New-Object System.Windows.Forms.Label
+        $ml.Location = New-Object System.Drawing.Point(20, 30); $ml.Size = New-Object System.Drawing.Size(440, 60)
+        $ml.Text = 'Mise à jour du moteur de synchronisation...'
+        $mig.Controls.Add($ml); $mig.Show(); $mig.Refresh()
+        $migCb = { param($m) $ml.Text = $m; $mig.Refresh() }
+        try {
+            Invoke-LegacyMigration -Config $existing -Rclone $rclone -Status $migCb
+        } catch {
+            Write-Log "ERREUR migration: $($_.Exception.Message)" 'ERROR'
+            Show-Warn("La mise à jour du moteur a rencontré un problème :" + [Environment]::NewLine +
+                      $($_.Exception.Message) + [Environment]::NewLine + [Environment]::NewLine +
+                      "Aucune donnée n'est perdue. Tu peux relancer Cowork Bridge.")
+        } finally {
+            if ($mig.Visible) { $mig.Close() }
+        }
+        $existing = Normalize-Config (Load-Config -Dest $script:DefaultDest)
+    }
+
     if ($existing -and @(Get-SortedSources $existing).Count -gt 0) {
         Show-ManageDialog -Config $existing -Rclone $rclone
         return
