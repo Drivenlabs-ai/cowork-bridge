@@ -748,11 +748,12 @@ function Show-SelectionDialog {
     $script:DialogResult = $null
 
     $btnAdd.Add_Click({
-        $used = ($script:selRows | Measure-Object -Property SizeBytes -Sum).Sum
-        if (-not $used) { $used = [long]0 }
+        $used = [long]0
+        foreach ($r in $script:selRows) { $used += [long]$r.SizeBytes }
         $p = Select-DriveFolder -StartDir $StartDir
         if (-not $p) { return }
         if ($script:selRows | Where-Object { $_.Path -eq $p }) { $statusCb.Invoke('Ce dossier est déjà dans la liste.'); return }
+        if (-not (Confirm-NoDuplicateLeaf -Sources $script:selRows -Path $p -Noun 'dans la liste')) { return }
         $src = New-BrowsedSource -Path $p -AlreadyUsedBytes ([long]$used) -Dest ($txtDest.Text.Trim()) -Status $statusCb
         if ($src) { $script:selRows.Add($src); $refresh.Invoke(); $statusCb.Invoke('') }
     })
@@ -915,6 +916,7 @@ function Show-ManageDialog {
         $p = Select-DriveFolder -StartDir $start
         if (-not $p) { return }
         if ($script:mgSources | Where-Object { $_.Path -eq $p }) { $busy.Invoke('Ce dossier est déjà suivi.'); return }
+        if (-not (Confirm-NoDuplicateLeaf -Sources $script:mgSources -Path $p -Noun 'suivi')) { $busy.Invoke(''); return }
         $busy.Invoke('Calcul de la taille...')
         $src = New-BrowsedSource -Path $p -AlreadyUsedBytes ([long]0) -Dest $script:mgConfig.dest -Status $busy
         if (-not $src) { $busy.Invoke(''); return }
@@ -967,6 +969,21 @@ function Show-ManageDialog {
 function Show-Info($msg)  { [void][System.Windows.Forms.MessageBox]::Show($msg, $script:AppName, 'OK', 'Information') }
 function Show-Warn($msg)  { [void][System.Windows.Forms.MessageBox]::Show($msg, $script:AppName, 'OK', 'Warning') }
 function Confirm-YesNo($msg) { return ([System.Windows.Forms.MessageBox]::Show($msg, $script:AppName, 'YesNo', 'Question') -eq 'Yes') }
+
+# Garde anti-doublon « même nom + type, chemin différent » (typiquement un montage Drive
+# qui a changé de lettre). Retourne $true si on peut ajouter : aucun homonyme, ou l'utilisateur
+# confirme malgré le doublon probable. $false = abandon. $Noun adapte le message selon le flux.
+function Confirm-NoDuplicateLeaf {
+    param([object[]]$Sources, [string]$Path, [string]$Noun)
+    $leaf = Split-Path $Path -Leaf
+    $type = Get-SourceType $Path
+    if ($Sources | Where-Object { $_.Name -eq $leaf -and $_.Type -eq $type }) {
+        return (Confirm-YesNo("Un dossier nommé « $leaf » est déjà $Noun." + [Environment]::NewLine +
+            "C'est peut-être le même (le chemin Google Drive a pu changer)." + [Environment]::NewLine +
+            "L'ajouter quand même ?"))
+    }
+    return $true
+}
 
 function Start-Bridge {
     if (Invoke-UpdateCheck) { return }
