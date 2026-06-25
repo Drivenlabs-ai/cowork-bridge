@@ -259,11 +259,11 @@ function New-FiltersFile([string]$Path) {
         '- thumbs.db'
         '- .tmp.drivedownload/'
         '- .tmp.driveupload/'
-        '- *.ffs_db'
-        '- sync.ffs_db*'
+        '- *.ffs_db*'
         '- *.ffs_lock'
         '- *.ffs_batch'
         '- *.ffs_real'
+        '- *.ffs_tmp'
     )
     [System.IO.File]::WriteAllText($Path, ($lines -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
@@ -282,7 +282,7 @@ function Set-Marker([string]$Folder) {
 # Construit la ligne d'arguments rclone bisync pour une paire (chemins entre guillemets ;
 # Assert-SafePath garantit qu'aucun chemin ne contient de guillemet -> pas d'évasion).
 function Get-BisyncArgLine {
-    param([string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$Resync)
+    param([string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$Resync, [string]$ResyncMode = 'path1')
     Assert-SafePath $DrivePath; Assert-SafePath $LocalPath; Assert-SafePath $MetaDir
     $workdir = Join-Path $MetaDir 'bisync-state'
     $filters = Join-Path $MetaDir 'filters.txt'
@@ -300,14 +300,16 @@ function Get-BisyncArgLine {
         '--resilient', '--recover', '--max-lock', '2m',
         '--log-file', (& $q $log), '--log-level', 'INFO'
     )
-    if ($Resync) { $parts += @('--resync', '--resync-mode', 'path1') }
+    # path1 (Drive fait foi) à l'install ; 'newer' à la migration FFS->rclone pour préserver
+    # une édition locale plus récente que FFS n'avait pas encore poussée (sinon Drive l'écrase).
+    if ($Resync) { $parts += @('--resync', '--resync-mode', $ResyncMode) }
     return ($parts -join ' ')
 }
 
 # Lance une synchro bisync sur une paire. Retourne le code de sortie rclone (0 = ok).
 function Invoke-Bisync {
-    param([string]$RcloneExe, [string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$Resync)
-    $argLine = Get-BisyncArgLine -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $Resync
+    param([string]$RcloneExe, [string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$Resync, [string]$ResyncMode = 'path1')
+    $argLine = Get-BisyncArgLine -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $Resync -ResyncMode $ResyncMode
     $p = Start-Process -FilePath $RcloneExe -ArgumentList $argLine -WindowStyle Hidden -PassThru -Wait
     Write-Log "bisync '$LocalName' (resync=$Resync) code $($p.ExitCode)"
     return [int]$p.ExitCode
@@ -317,12 +319,12 @@ function Invoke-Bisync {
 # synchronisée (marqueur absent), sinon bisync normal. Marqueur posé après un run à 0.
 # Indispensable : une paire neuve SANS --resync fait sortir bisync en erreur.
 function Sync-Pair {
-    param([object]$Rclone, [string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$ForceResync)
+    param([object]$Rclone, [string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$ForceResync, [string]$ResyncMode = 'path1')
     $stateDir = Join-Path $MetaDir 'bisync-state'
     if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
     $pairState = Join-Path $stateDir ($LocalName + '.synced')
     $resync = $ForceResync -or -not (Test-Path $pairState)
-    $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $resync
+    $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $resync -ResyncMode $ResyncMode
     if ($code -eq 0) { New-Item -ItemType File -Path $pairState -Force | Out-Null }
     return $code
 }
@@ -545,7 +547,7 @@ function Normalize-Config([object]$Config) {
 function Apply-Config {
     param(
         [object[]]$Selected, [string]$Dest, [int]$IntervalMin,
-        [object]$Rclone, [bool]$FirstRun, [scriptblock]$Status
+        [object]$Rclone, [bool]$FirstRun, [scriptblock]$Status, [string]$ResyncMode = 'path1'
     )
     $say = { param($m) if ($Status) { & $Status $m } }
     if (-not (Test-UnderHome $Dest)) { throw "Working folder is outside the user folder: $Dest" }
@@ -581,7 +583,7 @@ function Apply-Config {
     # SON propre --resync, sinon bisync sort en erreur).
     $worst = 0
     foreach ($p in $pairs) {
-        $code = Sync-Pair -Rclone $Rclone -DrivePath $p.Drive -LocalPath $p.Local -MetaDir $meta -LocalName $p.LocalName -ForceResync $FirstRun
+        $code = Sync-Pair -Rclone $Rclone -DrivePath $p.Drive -LocalPath $p.Local -MetaDir $meta -LocalName $p.LocalName -ForceResync $FirstRun -ResyncMode $ResyncMode
         if ($code -gt $worst) { $worst = $code }
     }
 
@@ -611,7 +613,7 @@ function Remove-TrackedFolder {
         # remontée copie-seule local -> Drive (jamais de suppression côté Drive)
         $log = Join-Path $meta 'rclone.log'
         $filters = Join-Path $meta 'filters.txt'
-        if (-not (Test-Path $filters)) { New-FiltersFile $filters }
+        New-FiltersFile $filters   # toujours régénéré : un filters.txt d'un ancien build (sans exclusions FFS) ferait re-échouer la remontée
         Assert-SafePath $filters
         $argLine = @('copy', ('"{0}"' -f $local), ('"{0}"' -f $Source.Path),
             '--filters-file', ('"{0}"' -f $filters),
@@ -659,14 +661,14 @@ function Test-NeedsMigration([object]$Config) {
 function Remove-FfsArtifacts {
     param([string]$Dest, [object[]]$Sources)
     $meta = Get-MetaDir $Dest
-    foreach ($pat in @('*.ffs_batch', '*.ffs_real', '*.ffs_db', 'sync.ffs_db*', '*.ffs_lock')) {
+    foreach ($pat in @('*.ffs_batch', '*.ffs_real', '*ffs_db*', '*.ffs_lock', '*.ffs_tmp')) {
         try { Get-ChildItem -Path $meta -Filter $pat -Force -ErrorAction SilentlyContinue |
                 Where-Object { -not $_.PSIsContainer } | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
     }
     foreach ($s in $Sources) {
         $local = Join-Path $Dest (Resolve-LocalName $s)
         if (-not (Test-Path $local)) { continue }
-        foreach ($pat in @('*.ffs_db', 'sync.ffs_db*', '*.ffs_lock')) {
+        foreach ($pat in @('*ffs_db*', '*.ffs_lock', '*.ffs_tmp')) {
             try { Get-ChildItem -Path $local -Filter $pat -Recurse -Force -ErrorAction SilentlyContinue |
                     Where-Object { -not $_.PSIsContainer } | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
         }
@@ -730,8 +732,10 @@ function Invoke-LegacyMigration {
     & $say 'Switching to the new engine (may take a moment)...'
     # Apply-Config réécrit config.json en v2, pose markers + filtres (FFS exclus), baseline
     # --resync (local et Drive déjà alignés par FFS -> union quasi nulle), installe l'agent.
-    Apply-Config -Selected $sources -Dest $dest -IntervalMin ([int]$Config.interval) -Rclone $Rclone -FirstRun $true -Status $Status | Out-Null
-    Write-Log "Migration complete: $($sources.Count) folder(s) switched to rclone."
+    # ResyncMode 'newer' : préserve une édition locale plus récente (FFS a déjà aligné les deux côtés).
+    $res = Apply-Config -Selected $sources -Dest $dest -IntervalMin ([int]$Config.interval) -Rclone $Rclone -FirstRun $true -ResyncMode 'newer' -Status $Status
+    Write-Log "Migration complete: $($sources.Count) folder(s) switched to rclone (first-sync code $($res.ExitCode))."
+    if ([int]$res.ExitCode -ne 0) { Write-Log "Migration: first sync code $($res.ExitCode); the resident agent will retry resync until a baseline is set." 'WARN' }
     return $true
 }
 
