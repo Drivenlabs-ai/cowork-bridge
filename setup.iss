@@ -61,16 +61,17 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ;UninstallDisplayIcon={app}\app.ico
 
 [Languages]
-Name: "french"; MessagesFile: "compiler:Languages\French.isl"
+Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 ; Icône sur le bureau : proposée (cochée par défaut), jamais imposée.
-Name: "desktopicon"; Description: "Créer une icône sur le bureau"; GroupDescription: "Raccourcis :"
+Name: "desktopicon"; Description: "Create a desktop icon"; GroupDescription: "Shortcuts:"
 
 [Files]
 Source: "Install-CoworkBridge.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Run-CoworkBridge.bat";     DestDir: "{app}"; Flags: ignoreversion
-Source: "GUIDE.md";                 DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "README.md";                DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "GUIDE.md";                 DestDir: "{app}"; Flags: ignoreversion
 ; Moteur de synchro rclone (MIT) bundlé : récupéré + vérifié par la CI (étape
 ; "Bundle rclone"), posé à côté du script. La notice MIT accompagne le binaire
 ; (obligation de la licence). Requis : un installeur sans moteur serait cassé.
@@ -83,27 +84,27 @@ Source: "VERSION";                  DestDir: "{app}"; Flags: ignoreversion skipi
 
 [Icons]
 ; Lancement sans console qui flashe : powershell en fenêtre cachée, l'UI WinForms s'affiche.
-Name: "{group}\Configurer {#MyAppShortName}"; \
+Name: "{group}\Configure {#MyAppShortName}"; \
     Filename: "powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File ""{app}\Install-CoworkBridge.ps1"""; \
     WorkingDir: "{app}"; \
-    Comment: "Ouvrir l'installeur / le panneau de gestion de Cowork Bridge"
-Name: "{group}\Guide {#MyAppShortName}"; Filename: "{app}\GUIDE.md"
-Name: "{group}\Désinstaller {#MyAppShortName}"; Filename: "{uninstallexe}"
+    Comment: "Open the Cowork Bridge setup / control panel"
+Name: "{group}\Guide {#MyAppShortName}"; Filename: "{app}\README.md"
+Name: "{group}\Uninstall {#MyAppShortName}"; Filename: "{uninstallexe}"
 ; Icône bureau (optionnelle via la tâche desktopicon), même lancement caché.
 Name: "{autodesktop}\{#MyAppShortName}"; \
     Filename: "powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File ""{app}\Install-CoworkBridge.ps1"""; \
     WorkingDir: "{app}"; \
     Tasks: desktopicon; \
-    Comment: "Ouvrir Cowork Bridge"
+    Comment: "Open Cowork Bridge"
 
 [Run]
 ; Proposer de lancer la configuration à la fin de l'installation.
 Filename: "powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File ""{app}\Install-CoworkBridge.ps1"""; \
     WorkingDir: "{app}"; \
-    Description: "Configurer {#MyAppShortName} maintenant"; \
+    Description: "Configure {#MyAppShortName} now"; \
     Flags: postinstall nowait skipifsilent
 
 [UninstallRun]

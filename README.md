@@ -38,7 +38,7 @@ Only the folders you pick are made local, so your disk holds just what you actua
 
 ## Quickstart
 
-> The app's setup screens are currently in **French**. Each button below is given as it appears on screen, with the English meaning in parentheses. Labels can also vary slightly between versions.
+> Button names below are given as they appear on screen; labels can vary slightly between versions.
 
 ### 1. Prerequisite — Google Drive for desktop in *Stream files* mode
 
@@ -56,9 +56,9 @@ Double-click the file. Because the installer isn't code-signed yet, Windows Smar
 
 ### 4. Choose your folders
 
-In the setup window, click **« Ajouter un dossier »** (*Add a folder*), browse to a Google Drive folder, and open it. Repeat for each folder you want available in Cowork. Add only what you actually work on — that's what takes up space on your PC. The tool **refuses** a folder that wouldn't fit on your disk with margin (a full system drive can stop Windows from loading your session, so this guard is deliberate).
+In the setup window, click **Add a folder**, browse to a Google Drive folder, and open it. Repeat for each folder you want available in Cowork. Add only what you actually work on — that's what takes up space on your PC. The tool **refuses** a folder that wouldn't fit on your disk with margin (a full system drive can stop Windows from loading your session, so this guard is deliberate).
 
-Leave the **working folder** at its default, `C:\Users\<you>\CoworkWork` (it must stay inside your user folder). Click **« Installer »** (*Install*). The first copy from Drive starts.
+Leave the **working folder** at its default, `C:\Users\<you>\CoworkWork` (it must stay inside your user folder). Click **Install**. The first copy from Drive starts.
 
 ### 5. Connect it in Cowork
 
@@ -83,22 +83,21 @@ The two-way sync is built to never lose data:
 
 ## Keeping it updated
 
-Once installed, Cowork Bridge updates itself. On launch — and from the **« Vérifier les mises à jour »** (*Check for updates*) button — it checks for a newer release, verifies its checksum, and updates in place, keeping your folders and settings. You never reinstall by hand.
+Once installed, Cowork Bridge updates itself. On launch — and from the **Check for updates** button — it checks for a newer release, verifies its checksum, and updates in place, keeping your folders and settings. You never reinstall by hand.
 
 ## Managing your folders
 
 Run Cowork Bridge again after setup and you get the control panel, where you can:
 
-- **« Ajouter un dossier »** (*Add a folder*) or **« Désynchroniser le dossier sélectionné »** (*Unsync the selected folder*) — unsyncing first copies the folder back up to Drive, then frees the local copy (nothing is deleted from Drive).
+- **Add a folder** or **Unsync the selected folder** — unsyncing first copies the folder back up to Drive, then frees the local copy (nothing is deleted from Drive).
 - change how often changes are pulled from Drive,
-- **« Synchroniser maintenant »** (*Sync now*), open the local folder, check for updates, or uninstall.
+- **Sync now**, open the local folder, check for updates, or uninstall.
 
 ## Limitations & honesty
 
 - **Windows only.** The same wall exists on macOS, but this installer (and the background agent) is Windows-only for now. rclone itself is cross-platform, so a Mac port is possible.
 - **It's a workaround, not a fix.** It exists because Cowork can't currently read cloud folders directly. The day Cowork supports them natively, you won't need this anymore.
 - **The installer isn't code-signed yet**, so you'll see the SmartScreen "unknown publisher" warning on install and on auto-updates.
-- **The app interface is in French** today. The steps above map every button to its English meaning; a localized interface is on the list.
 
 ## Why this exists
 
