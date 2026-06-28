@@ -264,8 +264,23 @@ function New-FiltersFile([string]$Path) {
         '- *.ffs_batch'
         '- *.ffs_real'
         '- *.ffs_tmp'
+        '- __pycache__/'
+        '- .git/'
+        '- node_modules/'
+        '- .venv/'
+        '- venv/'
     )
-    [System.IO.File]::WriteAllText($Path, ($lines -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+    $content = ($lines -join "`r`n")
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    # Écriture atomique : l'agent résident peut lire filters.txt en plein bisync (--filters-file).
+    # Temp + Replace évite qu'il tombe sur un fichier tronqué ; repli sur écriture directe si besoin.
+    try {
+        $tmp = "$Path.new"
+        [System.IO.File]::WriteAllText($tmp, $content, $enc)
+        if (Test-Path $Path) { [System.IO.File]::Replace($tmp, $Path, $null) } else { [System.IO.File]::Move($tmp, $Path) }
+    } catch {
+        [System.IO.File]::WriteAllText($Path, $content, $enc)
+    }
 }
 
 # Marqueur d'accès (--check-access) : sa présence des deux côtés prouve que le dossier
@@ -297,6 +312,7 @@ function Get-BisyncArgLine {
         '--max-delete', '25',
         '--conflict-resolve', 'none',
         '--backup-dir2', (& $q $backup),
+        '--checkers', '4', '--transfers', '4',   # concurrence basse (rclone.org : baisser --checkers sur backend lent) ; valeur à valider sur Windows
         '--resilient', '--recover', '--max-lock', '2m',
         '--log-file', (& $q $log), '--log-level', 'INFO'
     )
@@ -393,6 +409,7 @@ function Run-All {
             '--workdir', ('"{0}"' -f `$stateDir), '--filters-file', ('"{0}"' -f `$filters),
             '--check-access', '--check-filename', `$marker, '--max-delete', '25',
             '--conflict-resolve', 'none', '--backup-dir2', ('"{0}"' -f `$backup),
+            '--checkers', '4', '--transfers', '4',
             '--resilient', '--recover', '--max-lock', '2m',
             '--log-file', ('"{0}"' -f `$log), '--log-level', 'INFO')
         if (-not (Test-Path `$pairState)) { `$argLine += @('--resync', '--resync-mode', 'path1') }
@@ -617,6 +634,7 @@ function Remove-TrackedFolder {
         Assert-SafePath $filters
         $argLine = @('copy', ('"{0}"' -f $local), ('"{0}"' -f $Source.Path),
             '--filters-file', ('"{0}"' -f $filters),
+            '--checkers', '4', '--transfers', '4',
             '--log-file', ('"{0}"' -f $log), '--log-level', 'INFO') -join ' '
         $pushed = $false
         try {
@@ -677,11 +695,26 @@ function Remove-FfsArtifacts {
 
 # Sources legacy -> sources v2, dédupliquées par Path (premier gagné -> tue le doublon FFS).
 function Get-MigratedSources([object]$Config) {
-    $seen = New-Object System.Collections.Generic.HashSet[string]
-    $out  = New-Object System.Collections.Generic.List[object]
+    # Dédup par Path, DÉTERMINISTE : pour un même Path on garde la source dont le LocalName n'a PAS
+    # de suffixe « (N) » (la copie primaire), sinon le plus court. Évite l'ordre instable de
+    # Sort-Object Type,Name (qui orphelinait la primaire au profit de « ... (2) »).
+    # Préférence : une source AVEC LocalName, puis le LocalName le plus COURT (un dup « X (2) » est
+    # toujours plus long que sa primaire « X »). Pas de regex de suffixe : un dossier nommé
+    # légitimement « ... (2024) » la trompait. Le 100000 sépare deux tiers (LocalName < MAX_PATH).
+    $rank = {
+        param($src)
+        $ln = if (($src.PSObject.Properties.Name -contains 'LocalName') -and $src.LocalName) { [string]$src.LocalName } else { '' }
+        $noLocal = if ($ln) { 0 } else { 1 }
+        return ($noLocal * 100000 + $ln.Length)
+    }
+    $best = @{}
     foreach ($s in (Get-SortedSources $Config)) {
         if (-not ($s.PSObject.Properties.Name -contains 'Path') -or -not $s.Path) { continue }
-        if (-not $seen.Add(([string]$s.Path).ToLowerInvariant())) { continue }
+        $key = ([string]$s.Path).ToLowerInvariant()
+        if ((-not $best.ContainsKey($key)) -or ((& $rank $s) -lt (& $rank $best[$key]))) { $best[$key] = $s }
+    }
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($s in ($best.Values | Sort-Object { [string]$_.Path })) {
         $type = if (($s.PSObject.Properties.Name -contains 'Type') -and $s.Type) { [string]$s.Type } else { Get-SourceType ([string]$s.Path) }
         $name = if (($s.PSObject.Properties.Name -contains 'Name') -and $s.Name) { [string]$s.Name } else { Split-Path ([string]$s.Path) -Leaf }
         $o = [pscustomobject]@{ Type = $type; Name = $name; Path = [string]$s.Path }
@@ -760,8 +793,11 @@ function Select-DriveFolder {
 }
 
 function New-BrowsedSource {
-    param([string]$Path, [long]$AlreadyUsedBytes, [string]$Dest, [scriptblock]$Status)
-    $say = { param($m) if ($Status) { & $Status $m } }
+    # $OnStatus (et pas $Status) : un callback de statut référence la variable $status (le Label) ;
+    # PowerShell étant insensible à la casse, un param $Status le ferait résoudre sur CE scriptblock
+    # (-> '<ScriptBlock>.Text' introuvable). Le nom distinct évite la collision.
+    param([string]$Path, [long]$AlreadyUsedBytes, [string]$Dest, [scriptblock]$OnStatus)
+    $say = { param($m) if ($OnStatus) { & $OnStatus $m } }
     & $say 'Calculating folder size...'
     $size = Get-FolderSizeBytes $Path
     $budget = Test-DiskBudget ($AlreadyUsedBytes + $size) $Dest
@@ -863,7 +899,7 @@ function Show-SelectionDialog {
         if (-not $p) { return }
         if ($script:selRows | Where-Object { $_.Path -eq $p }) { $statusCb.Invoke('This folder is already in the list.'); return }
         if (-not (Confirm-NoDuplicateLeaf -Sources $script:selRows -Path $p -Noun 'in the list')) { return }
-        $src = New-BrowsedSource -Path $p -AlreadyUsedBytes ([long]$used) -Dest ($txtDest.Text.Trim()) -Status $statusCb
+        $src = New-BrowsedSource -Path $p -AlreadyUsedBytes ([long]$used) -Dest ($txtDest.Text.Trim()) -OnStatus $statusCb
         if ($src) { $script:selRows.Add($src); $refresh.Invoke(); $statusCb.Invoke('') }
     })
     $btnRem.Add_Click({
@@ -1027,7 +1063,7 @@ function Show-ManageDialog {
         if ($script:mgSources | Where-Object { $_.Path -eq $p }) { $busy.Invoke('This folder is already tracked.'); return }
         if (-not (Confirm-NoDuplicateLeaf -Sources $script:mgSources -Path $p -Noun 'tracked')) { $busy.Invoke(''); return }
         $busy.Invoke('Calculating size...')
-        $src = New-BrowsedSource -Path $p -AlreadyUsedBytes ([long]0) -Dest $script:mgConfig.dest -Status $busy
+        $src = New-BrowsedSource -Path $p -AlreadyUsedBytes ([long]0) -Dest $script:mgConfig.dest -OnStatus $busy
         if (-not $src) { $busy.Invoke(''); return }
         $busy.Invoke('Adding and syncing...')
         $newSel = @($script:mgSources | ForEach-Object { [pscustomobject]@{ Type = $_.Type; Name = $_.Name; Path = $_.Path } }) + @([pscustomobject]@{ Type = $src.Type; Name = $src.Name; Path = $src.Path })
@@ -1132,6 +1168,17 @@ function Start-Bridge {
     }
 
     if ($existing -and @(Get-SortedSources $existing).Count -gt 0) {
+        # Rafraîchit la config de synchro au lancement : un upgrade binaire ne relance pas Apply-Config,
+        # donc filters.txt ET l'agent résident garderaient l'ancien jeu (anciennes exclusions, pas de
+        # throttle --checkers). On régénère les deux ici pour qu'un client mis à jour en bénéficie.
+        try {
+            if (Test-UnderHome $existing.dest) {
+                $rm = Get-MetaDir $existing.dest
+                New-FiltersFile (Join-Path $rm 'filters.txt')
+                Remove-SyncAgent
+                Set-SyncAgent -RcloneExe $rclone.Exe -MetaDir $rm -IntervalMin ([int]$existing.interval) | Out-Null
+            }
+        } catch {}
         Show-ManageDialog -Config $existing -Rclone $rclone
         return
     }
