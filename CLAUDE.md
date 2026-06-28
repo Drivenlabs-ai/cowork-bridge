@@ -8,30 +8,30 @@ Le sandbox de Claude Cowork (VM Hyper-V, montage hôte→VM en **virtiofs / Plan
 
 Conséquence : seule issue stable = donner à Cowork un vrai dossier local plat dans le home, alimenté automatiquement depuis Drive.
 
-## Architecture (décision verrouillée : moteur A)
+## Architecture (Archi A : rclone sur le dossier Drive Desktop)
 
 ```
-cloud <->[Google Drive Desktop, mode STREAM]<-> Mon Drive\X <->[FreeFileSync]<-> %USERPROFILE%\CoworkWork\X -> Cowork
+cloud <->[Google Drive Desktop, mode STREAM]<-> Mon Drive\X <->[rclone bisync, local<->local]<-> %USERPROFILE%\CoworkWork\X -> Cowork
 ```
 
-- **Mode Stream, pas Miroir** : tout le Drive reste en placeholders (≈0 octet) ; seuls les dossiers pontés sont hydratés. Le bridge ne fait donc pas exploser le stockage, il le réduit vs Miroir.
-- **FreeFileSync** comme moteur : two-way + gestion de conflits + cross-platform (un seul outil pour un parc Win/Mac). Suppressions → corbeille.
-- **Ciblage** : on ajoute les dossiers **par l'explorateur** (`Select-DriveFolder`, OpenFileDialog détourné — barre d'adresse + navigation), pas par une liste auto-détectée. Avant chaque ajout : **garde-fou disque** (`Test-DiskBudget` / `New-BrowsedSource`) — refuse si le dossier ne tient pas sur C: avec une marge (`$DiskMarginBytes` ≈ 5 Go). **Critique** : un disque plein empêche Windows de charger le profil → session temporaire vierge (incident observé chez Dylan). Stockage local ≈ Σ(dossiers suivis).
-- Synchro de fond : **RealTimeSync** (démarrage, push instantané + pull à chaque modif locale) + **boucle résidente unique** (`Set-SyncLoop` → `_bridge\sync-loop.ps1`, dossier Démarrage, sans droits) pour le **pull périodique** : relit l'intervalle (`_bridge\interval`) à chaque tour (délai **modifiable à chaud**), écrit l'heure de prochaine synchro (`_bridge\next-sync`, source du **minuteur**), **verrou mono-instance** (ne lance pas FFS si une instance tourne → anti-chevauchement RTS). La tâche planifiée n'est plus le mécanisme (seulement `Unregister-SyncTask` au nettoyage) : elle échouait sur PC verrouillé (« Accès refusé ») et compliquait délai-live + minuteur.
-- **Sûreté des données** (post-revue) : la 1ʳᵉ synchro d'une nouvelle install est en **Miroir Drive → local** (`Variant=Mirror`, ne touche jamais le côté Drive) ; la synchro courante seulement est `TwoWay`. Suppressions = `DeletionPolicy=RecycleBin`. La libération d'une copie locale (déselect) passe par la **corbeille** (`Microsoft.VisualBasic.FileIO`) et **uniquement si la dernière synchro a réussi** (exit ≤ 1). Garde anti-collision sur les noms de dossiers locaux.
+- **Moteur = rclone** (licence MIT, **bundlé** dans l'installeur). `rclone bisync` entre DEUX chemins locaux (dossier monté par Drive Desktop ⇄ dossier de travail) — **aucun OAuth, aucun remote**. Choix vs FreeFileSync : FFS interdisait le bundling et l'usage pro de l'édition gratuite ; rclone est librement redistribuable.
+- **Mode Stream, pas Miroir** : tout le Drive reste en placeholders ; seuls les dossiers pontés sont hydratés. Stockage local ≈ Σ(dossiers suivis).
+- **Ciblage** : ajout **par l'explorateur** (`Select-DriveFolder`, OpenFileDialog détourné). Avant chaque ajout : **garde-fou disque** (`Test-DiskBudget` / `New-BrowsedSource`) — refuse si le dossier ne tient pas sur C: avec une marge (`$DiskMarginBytes` ≈ 5 Go). **Critique** : un disque plein empêche Windows de charger le profil → session vierge (incident Dylan).
+- **Synchro de fond** : **agent résident unique** (`Set-SyncAgent` → `_bridge\sync-agent.ps1`, dossier Démarrage, sans droits) = `FileSystemWatcher` (push quasi instantané, récupéré par **`Wait-Event`** qui pompe la file — pas `-Action`+`Start-Sleep` qui ne déclenche pas en `-File`) **+** timer toutes les N min (pull). Relit `config.json` + `_bridge\interval` à chaque tour (délai à chaud, ajout/désync pris en compte sans redémarrer l'agent), écrit `_bridge\next-sync` (minuteur). Boucle mono-thread = mono-instance.
+- **Sûreté des données** (flags rclone sourcés) : 1er run d'une paire = `bisync --resync --resync-mode path1` (Drive=Path1 fait foi, **union**, jamais d'effacement Drive). Garde-fous : `--check-access` + marqueur `.coworkbridge-ok` des deux côtés (abort si un côté vu vide/non monté), `--max-delete 25`, `--conflict-resolve none` (garde les 2 versions), `--backup-dir2` local daté (équivalent corbeille) + corbeille Drive native côté Drive, `--resilient --recover --max-lock 2m`. Désync (`Remove-TrackedFolder`) = `rclone copy` local→Drive (copie seule, gardé sur exit 0) puis corbeille du local.
 
-Alternative évaluée et reportée en v2 : **rclone direct** (API Drive, sans Drive Desktop) → stockage ×1 exact, shared drives natifs, mais nécessite une app Google OAuth Drivenlabs (setup + vérification Google). Voir la conversation d'origine.
+⚠️ **Risque assumé d'Archi A** : on garde la couche Drive Desktop stream → le risque placeholder (hydratation, « placeholder vu comme supprimé ») persiste. `--check-access` couvre « dossier entier vide », pas le placeholder individuel → **test Windows bloquant**. Archi B (rclone direct API, sans Drive Desktop) éliminerait ce risque mais a été écartée (friction OAuth + coût vérification Google « restricted scope » : CASA $500–4 500/an, ou client_id par client).
 
 ## Fichiers
 
 - `Run-CoworkBridge.bat` — lanceur (PowerShell `-STA -ExecutionPolicy Bypass`).
-- `Install-CoworkBridge.ps1` — installeur + **centre de contrôle** WinForms (PS 5.1, pas de PS7). Install : choix des dossiers **par l'explorateur** + garde disque → `Apply-Config` (configs FFS, RTS + boucle, 1ʳᵉ synchro Miroir). Si install existante → **panneau de gestion** : liste des dossiers suivis, **Ajouter** (explorateur), **Désynchroniser** par dossier (`Remove-TrackedFolder` : remontée Update local→Drive puis corbeille), **délai applicable à chaud** (Appliquer → écrit `_bridge\interval`), **minuteur** (Timer lit `_bridge\next-sync`), Synchroniser, Ouvrir, MAJ, Désinstaller. `Apply-Config` est factorisé (install / ajout / désync). **⚠ Doit rester encodé UTF-8 AVEC BOM** : PS 5.1 lit un `.ps1` sans BOM en codepage ANSI et casse tous les accents des chaînes UI. Après toute réédition avec un outil qui retire le BOM, le réajouter (`printf '\xEF\xBB\xBF'` en tête). Identifiants de code en anglais, chaînes UI en français accentué.
+- `Install-CoworkBridge.ps1` — installeur + **centre de contrôle** WinForms (PS 5.1, pas de PS7). Moteur **rclone** (`Find-Rclone` → `rclone.exe` bundlé à côté du script). Install : choix des dossiers par l'explorateur + garde disque → `Apply-Config` (filtres, marqueurs, 1ʳᵉ synchro `bisync --resync`, agent). Si install existante → **panneau de gestion** : liste suivis, **Ajouter**, **Désynchroniser** (`Remove-TrackedFolder` : `rclone copy` local→Drive puis corbeille), **délai à chaud**, **minuteur**, Synchroniser, Ouvrir, MAJ, Désinstaller. `Apply-Config` factorisé. **Migration FFS→rclone au lancement** (`Test-NeedsMigration`/`Invoke-LegacyMigration`) : une config v1 (FreeFileSync) déclenche, avant le panneau, l'arrêt de RealTimeSync, la purge des fichiers d'état `.ffs_*` côté local (jamais le Drive ; les `.ffs_db` volatils cassaient rclone — « corrupted on transfer », cas Dylan), la déduplication des sources par chemin, puis un `Apply-Config` rclone (baseline `--resync`, filtres FFS exclus, agent) — indispensable car les clients en prod sont sur FFS et s'auto-updateront vers rclone. Les filtres rclone excluent `*.ffs_db`/`sync.ffs_db*`/`*.ffs_batch`/`*.ffs_real`/`*.ffs_lock`, et la désync (`rclone copy`) applique aussi le fichier de filtres. Génère l'agent via `Set-SyncAgent` (here-string `@"..."@` → `$` des variables de l'agent **backtické** ; seuls `$rcLit`/`$metaLit`/`$markLit` interpolés ; chemins échappés `''`). **⚠ UTF-8 AVEC BOM obligatoire** (PS 5.1 lit sans BOM en ANSI → accents cassés ; réajouter `printf '\xEF\xBB\xBF'`). Sécurité : `Assert-SafePath` (rejette CR/LF, `"`) sur tout chemin avant génération ; sinks `Start-Process` utilisent l'exe re-résolu, jamais un chemin de config ; `Test-UnderHome` rejoué avant toute création/suppression.
 - `GUIDE.md` — guide client + checklist de déploiement Drivenlabs.
 - `setup.iss` — script Inno Setup → installeur Windows pro (per-user, sans admin ; menu Démarrer, désinstalleur, lance la config au « Terminé »). Compilé sur Windows (CI ou machine Windows), pas sur Mac.
 - `.github/workflows/build.yml` — CI : runner Windows compile l'installeur, signe si secrets présents, publie l'artefact (et une Release sur tag `v*`).
 - `.gitignore` — ignore `Output/`, `*.exe`, `*.pfx`.
 
-État runtime chez le client : `%USERPROFILE%\CoworkWork\_bridge\` (`config.json`, `bridge.ffs_batch`, `bridge.ffs_real`, `sync-loop.ps1`, `interval`, `next-sync`, `bridge.log`).
+État runtime chez le client : `%USERPROFILE%\CoworkWork\_bridge\` (`config.json`, `sync-agent.ps1`, `filters.txt`, `interval`, `next-sync`, `bisync-state\` [listings rclone], `trash\<date>\` [backups], `rclone.log`, `bridge.log`). Marqueur `.coworkbridge-ok` dans chaque dossier suivi (local + Drive) pour `--check-access`.
 
 ## Build & distribution (pro)
 
@@ -39,15 +39,15 @@ Alternative évaluée et reportée en v2 : **rclone direct** (API Drive, sans Dr
 - **CI = build + release** (`.github/workflows/build.yml`) : à CHAQUE push sur `main`, version **par date** `YYYY.M.D.N` (N = nombre de commits du jour, auto), build de l'exe, `CHECKSUM` SHA256, puis **Release GitHub** (tag `vYYYY.M.D.N`) avec assets `CoworkBridge-Setup.exe` + `CHECKSUM` + `VERSION`. Plus de tag manuel, plus d'Azure. Versionné via `ISCC /DMyAppVersion /DMyAppVersionInfo`.
 - **Mise à jour (pattern dentalsoft, appliqué à l'exe)** : l'app, au lancement (`Invoke-UpdateCheck` au début de `Start-Bridge`) **et** via le bouton « Vérifier les mises à jour », interroge `releases/latest` (repo public → API anonyme), compare la `VERSION` installée (lue dans `{app}\VERSION`, shippée par `setup.iss`) à la dernière release ; si plus récente → télécharge l'exe, **vérifie le SHA256** contre `CHECKSUM`, `Unblock-File`, le lance → Inno met à jour **en place** (AppId stable, config + données dans le profil conservées). Intégrité par **checksum**, pas par signature.
 - **Signature de code : reportée** (jugée trop lourde pour l'instant). Conséquence assumée : l'exe non signé déclenche l'avertissement SmartScreen « éditeur inconnu » au 1er lancement. Voie moderne si on la veut un jour : **Azure Artifact Signing** (HSM cloud, ~9,99 $/mois, éligible UE, action `azure/trusted-signing-action@v2`, 6 secrets `AZURE_*`) — depuis juin 2023 plus de `.pfx`, signature cloud obligatoire. À rebrancher comme étape CI séparée le moment venu.
-- **Licence FreeFileSync** : ⚠ NON redistribué dans l'installeur (donationware propriétaire, droits de redistribution à vérifier). v1 = détection + guidage par le script. Décision à prendre après vérif licence : bundler le portable, ou télécharger l'installeur officiel FFS à l'install (`/VERYSILENT`), ou rester en prérequis guidé.
+- **Moteur rclone bundlé** : la CI (étape `Bundle rclone`) télécharge `rclone-v<ver>-windows-amd64.zip` (version épinglée v1.74.3), **vérifie le SHA256 contre le `SHA256SUMS` officiel de rclone** (pas de hash en dur), extrait `rclone.exe` + la notice MIT (`rclone-LICENSE.txt`) ; `setup.iss` les embarque. Licence MIT → redistribution commerciale + bundling autorisés (seule obligation : joindre la notice). Bumper la version = changer `$ver` dans `build.yml`.
 - **Icône** : `assets\app.ico` (lignes commentées dans `setup.iss`) — déposer le `.ico` Drivenlabs pour le branding, puis décommenter.
 
 ## Déploiement client (checklist interne)
 
 Note : le repo est public, donc le `GUIDE.md` est grand public — cette checklist vit ici, pas dans le guide.
 
-1. **Prérequis machine** : Google Drive pour ordinateur (mode **« Accéder en ligne aux fichiers »**, surtout pas « Dupliquer les fichiers ») + FreeFileSync. Les pré-installer évite la friction.
-2. Donner au client l'`.exe` signé (Release GitHub une fois le cert posé ; d'ici là, l'artefact de build).
+1. **Prérequis machine** : Google Drive pour ordinateur (mode **« Accéder en ligne aux fichiers »**, surtout pas « Dupliquer les fichiers »). **Seul prérequis** — le moteur rclone est bundlé dans l'installeur.
+2. Donner au client l'`.exe` (Release GitHub). Non signé → avertissement SmartScreen « éditeur inconnu » au 1er lancement (et désormais aussi sur les auto-updates, `Unblock-File` retiré) — prévenir le client.
 3. Installer → cocher les dossiers métier + Drive partagés pertinents → connecter `CoworkWork` dans Cowork.
 4. **Valider** : ouvrir Cowork, vérifier que les fichiers sont **lisibles** (pas seulement listés — ouvrir un doc).
 5. Noter l'empreinte stockage = somme des dossiers cochés.
@@ -55,14 +55,15 @@ Note : le repo est public, donc le `GUIDE.md` est grand public — cette checkli
 Libellés Google Drive FR vérifiés (source officielle Google, juin 2026) : stream = « Accéder en ligne aux fichiers », miroir = « Dupliquer les fichiers », chemin « Paramètres → Préférences → Dossiers de Drive → Options de synchronisation de Mon Drive ». À reconfirmer sur la build installée chez le client (les libellés ont changé selon les versions).
 
 Limites connues :
-- Vaut pour Windows. Sur Mac le même mur existe (FileProvider) — le moteur FreeFileSync est cross-platform, mais l'installeur/PS est Windows-only (à porter si besoin).
+- Vaut pour Windows. Sur Mac le même mur existe (FileProvider) — rclone est cross-platform, mais l'installeur/PS (WinForms + agent FSW) est Windows-only (à porter si besoin).
 - C'est un **contournement**, pas un correctif Anthropic. À retirer le jour où Cowork supportera nativement les dossiers cloud (issues `area:cowork` du repo `anthropics/claude-code`).
 - Collision de noms de dossiers locaux : `Build-Pairs` trie de façon déterministe (stable dans tous les cas réalistes) ; un rename théorique ne survient que si deux dossiers de même type sanitizent vers le même nom (caractères illégaux) — quasi nul, non corrigé (réutiliser `LocalName` persisté fermerait le trou si besoin).
 
-## Détails techniques vérifiés
+## Détails techniques vérifiés (rclone, audit 2026-06-21, sources rclone.org)
 
-- `.ffs_batch` : `XmlType="BATCH" XmlFormat="13"` (FFS convertit les anciens formats vers l'avant). `Synchronize/Variant` = `TwoWay` (courant) ou `Mirror` (1er run), `DeletionPolicy=RecycleBin`, `Batch/ProgressDialog Minimized+AutoClose`, `Errors Ignore="true"` (c'est CE flag qui rend la synchro non bloquante en tâche planifiée ; `ErrorDialog` reste à la valeur vérifiée `Show` pour ne pas risquer un enum invalide qui ferait rejeter tout le batch). élément log = `<LogFolder/>` (vide = défaut) **à la racine**, PAS `<LogfileFolder>` ni dans `<Batch>` : schéma actuel vérifié dans la source FFS `config.cpp` (`XML_FORMAT_SYNC_CFG=23`, élément `LogFolder` lu à la racine) ; le `<Variant>` est migré par FFS depuis le format 13. C'était le bug « config incomplète / impossible de lire LogFolder » vu chez le client. Lancement : `FreeFileSync.exe "x.ffs_batch"` (codes 0=ok / 1=warn / 2=err / 3=annulé).
-- `.ffs_real` : `XmlType="REAL" XmlFormat="2"`, `Directories/Item`, `Delay`, `Commandline`. Lancé par `RealTimeSync.exe "x.ffs_real"`.
+- **bisync par paire** (1 appel par dossier suivi), local↔local : `rclone bisync "<Drive>" "<Local>" --workdir <_bridge\bisync-state> --filters-file <_bridge\filters.txt> --check-access --check-filename .coworkbridge-ok --max-delete 25 --conflict-resolve none --backup-dir2 <_bridge\trash\<date>\<name>> --resilient --recover --max-lock 2m --log-file <_bridge\rclone.log> --log-level INFO`. 1er run : `+ --resync --resync-mode path1`.
+- **Sûreté (vérifié doc)** : `--resync` est requis au 1er run et est une **union** (jamais de suppression côté Drive) ; `--conflict-resolve none` (défaut) garde les deux versions renommées `…conflict1/2` ; `--max-delete` en bisync = **pourcentage** (défaut 50%, on met 25) ; `--check-access` exige le marqueur des deux côtés AVANT le 1er resync (sinon il échoue) → on pose `.coworkbridge-ok` des deux côtés, et il **n'est PAS** exclu des filtres : `--check-access` applique `filters.txt`, donc l'exclure le rendait introuvable → abort systématique (vérifié sur Windows). Le marqueur se synchronise donc (inerte) ; ne PAS utiliser `--inplace` ; codes 0=ok, ≠0 = erreur. bisync = « advanced command », jamais déclaré production-ready → ≥ v1.66 (on épingle v1.74.3).
+- **Agent** : `Wait-Event -Timeout 5` (pompe la file FSW + tick périodique). `Register-ObjectEvent` SANS `-Action` (les events se mettent en file ; `-Action`+`Start-Sleep` ne déclenche pas en `-File`).
 - Détection Drive : scan des racines de lecteurs + home, recherche d'un enfant `My Drive`/`Mon Drive` et `Shared drives`/`Drive partages`.
 
 ## État
@@ -75,11 +76,14 @@ Revue 2 (post-packaging, CI + régression PS) et correctifs : **B1** la déséle
 
 **Réécriture (rewrite control-center)** : boucle unifiée (intervalle live, `next-sync`, mono-instance), `Apply-Config` factorisé, garde disque (`Test-DiskBudget`), config par explorateur (plus de liste auto-détectée), panneau = centre de contrôle (liste suivis, ajouter, désync par dossier, délai applicable, minuteur), tâche planifiée abandonnée comme mécanisme.
 
-⚠️ **Non exécuté sur Windows** (dev macOS, pas de `pwsh` ; structure vérifiée — accolades/parenthèses/here-strings équilibrées, BOM, `$args` réservé évité). À valider chez Dylan, priorités :
-1. `.ffs_batch` accepté par le FFS installé (`<LogFolder>` racine — déjà validé `code 0` au dernier test) ;
-2. garde disque : ajouter un dossier > espace libre → doit refuser ; recovery (supprimer `CoworkWork` + reboot) restaure le profil ;
-3. boucle résidente : pull périodique effectif, **délai modifiable à chaud** pris en compte, **minuteur** qui décompte ;
-4. désync d'un dossier : remontée Drive OK puis corbeille, fichiers Drive intacts ;
-5. sélecteur explorateur (OpenFileDialog détourné) ergonomique ;
-6. scoping des scriptblocks WinForms (handlers + helpers `$busy`/`$statusCb` invoqués via `.Invoke()`/`&`).
+**Revue sécurité (2026-06-19, sur `main`)** : risque dominant = chaîne d'auto-update (checksum ≠ authenticité, repo public). Correctifs livrés (v2026.6.19.3) : `Unblock-File` retiré (garde SmartScreen), assets par nom exact, exe re-résolu au lieu du chemin config, `Assert-SafePath` (CR/LF/`"`), `Test-UnderHome` + assainissement `LocalName` rejoués à la lecture, apostrophe XML. **Branch protection posée sur `main`** (PR obligatoire, pas de push direct admin). Restent ouverts : signature de code (différée), découplage release/push.
+
+**Pivot rclone — Archi A (branche `feat/rclone-engine`)** : FreeFileSync → rclone bisync (voir Architecture + Détails). Motif : FFS s'installait à la main ET sa licence interdit le bundling + l'usage pro de l'édition gratuite ; rclone (MIT) est bundlable. Audit complet (sûreté bisync, licence, packaging, archi) fait le 2026-06-21.
+
+⚠️ **Non exécuté sur Windows** (dev macOS ; structure vérifiée — accolades/parenthèses/here-strings équilibrées, BOM, `$Ffs` éliminé). **Test Windows BLOQUANT avant merge `main`** (Dylan), priorités :
+1. 🔑 **placeholder Drive stream** : un fichier non hydraté est-il vu « présent » (pas « supprimé/modifié ») par bisync ? pas d'hydratation massive au scan ? (le risque non couvert par la doc rclone) ;
+2. `bisync --resync` 1er run sûr (Drive fait foi, rien d'effacé côté Drive) ; `--check-access` déclenche bien l'abort si Drive non monté ;
+3. agent : push quasi instantané via `Wait-Event` + FSW effectif en `-File` ? pull périodique + délai à chaud + minuteur ;
+4. désync : `rclone copy` local→Drive OK puis corbeille, fichiers Drive intacts ;
+5. CI : étape `Bundle rclone` (checksum SHA256SUMS) + Inno embarque `rclone.exe`.
 Cible PS 5.1 (défaut Windows).

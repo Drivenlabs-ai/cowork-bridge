@@ -7,11 +7,11 @@
 ;     ISCC.exe setup.iss
 ;  -> sortie : Output\CoworkBridge-Setup-<version>.exe
 ;
-;  NOTE LICENCE : cet installeur NE redistribue PAS FreeFileSync (donationware
-;  propriétaire ; droits de redistribution à vérifier). Il installe nos fichiers
-;  et la logique de pont ; le script détecte FreeFileSync et guide l'utilisateur
-;  s'il manque. Le bundling/téléchargement-à-l'install de FFS sera ajouté une
-;  fois la licence vérifiée (voir CLAUDE.md).
+;  MOTEUR : rclone (licence MIT) est bundlé dans l'installeur — la MIT autorise
+;  explicitement la redistribution commerciale et le bundling. La notice MIT
+;  (rclone-LICENSE.txt) accompagne le binaire (obligation de la licence). Plus
+;  aucune dépendance à installer à la main. (FreeFileSync a été abandonné : sa
+;  licence interdisait le bundling et l'usage pro de l'édition gratuite.)
 ; ============================================================================
 
 #define MyAppName "Drivenlabs Cowork Bridge"
@@ -61,16 +61,22 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ;UninstallDisplayIcon={app}\app.ico
 
 [Languages]
-Name: "french"; MessagesFile: "compiler:Languages\French.isl"
+Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 ; Icône sur le bureau : proposée (cochée par défaut), jamais imposée.
-Name: "desktopicon"; Description: "Créer une icône sur le bureau"; GroupDescription: "Raccourcis :"
+Name: "desktopicon"; Description: "Create a desktop icon"; GroupDescription: "Shortcuts:"
 
 [Files]
 Source: "Install-CoworkBridge.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Run-CoworkBridge.bat";     DestDir: "{app}"; Flags: ignoreversion
-Source: "GUIDE.md";                 DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "README.md";                DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "GUIDE.md";                 DestDir: "{app}"; Flags: ignoreversion
+; Moteur de synchro rclone (MIT) bundlé : récupéré + vérifié par la CI (étape
+; "Bundle rclone"), posé à côté du script. La notice MIT accompagne le binaire
+; (obligation de la licence). Requis : un installeur sans moteur serait cassé.
+Source: "rclone.exe";               DestDir: "{app}"; Flags: ignoreversion
+Source: "rclone-LICENSE.txt";       DestDir: "{app}"; Flags: ignoreversion
 ; VERSION : écrit par la CI (date-version) ; permet à l'app de connaître sa
 ; version installée pour la vérif de mise à jour. Absent en build local -> ignoré.
 Source: "VERSION";                  DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
@@ -78,33 +84,34 @@ Source: "VERSION";                  DestDir: "{app}"; Flags: ignoreversion skipi
 
 [Icons]
 ; Lancement sans console qui flashe : powershell en fenêtre cachée, l'UI WinForms s'affiche.
-Name: "{group}\Configurer {#MyAppShortName}"; \
+Name: "{group}\Configure {#MyAppShortName}"; \
     Filename: "powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File ""{app}\Install-CoworkBridge.ps1"""; \
     WorkingDir: "{app}"; \
-    Comment: "Ouvrir l'installeur / le panneau de gestion de Cowork Bridge"
-Name: "{group}\Guide {#MyAppShortName}"; Filename: "{app}\GUIDE.md"
-Name: "{group}\Désinstaller {#MyAppShortName}"; Filename: "{uninstallexe}"
+    Comment: "Open the Cowork Bridge setup / control panel"
+Name: "{group}\Guide {#MyAppShortName}"; Filename: "{app}\README.md"
+Name: "{group}\Uninstall {#MyAppShortName}"; Filename: "{uninstallexe}"
 ; Icône bureau (optionnelle via la tâche desktopicon), même lancement caché.
 Name: "{autodesktop}\{#MyAppShortName}"; \
     Filename: "powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File ""{app}\Install-CoworkBridge.ps1"""; \
     WorkingDir: "{app}"; \
     Tasks: desktopicon; \
-    Comment: "Ouvrir Cowork Bridge"
+    Comment: "Open Cowork Bridge"
 
 [Run]
 ; Proposer de lancer la configuration à la fin de l'installation.
 Filename: "powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File ""{app}\Install-CoworkBridge.ps1"""; \
     WorkingDir: "{app}"; \
-    Description: "Configurer {#MyAppShortName} maintenant"; \
+    Description: "Configure {#MyAppShortName} now"; \
     Flags: postinstall nowait skipifsilent
 
 [UninstallRun]
-; Désinstaller le programme retire aussi la synchro de fond (tâche planifiée +
-; raccourci de démarrage + RealTimeSync). Les données locales (CoworkWork) sont
-; volontairement CONSERVÉES — on ne supprime jamais les fichiers de l'utilisateur.
+; Désinstaller le programme retire aussi la synchro de fond (agent résident +
+; raccourci de démarrage) et nettoie les anciens artefacts (tâche planifiée +
+; RealTimeSync). Les données locales (CoworkWork) sont volontairement CONSERVÉES —
+; on ne supprime jamais les fichiers de l'utilisateur.
 Filename: "powershell.exe"; \
-    Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Unregister-ScheduledTask -TaskName 'CoworkBridge-Sync' -Confirm:$false -ErrorAction SilentlyContinue; Remove-Item (Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge.lnk') -Force -ErrorAction SilentlyContinue; Get-Process RealTimeSync -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"""; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {{ $_.CommandLine -and ($_.CommandLine -like '*sync-agent.ps1*' -or $_.CommandLine -like '*sync-loop.ps1*') }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}; Remove-Item (Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge-Sync.lnk') -Force -ErrorAction SilentlyContinue; Remove-Item (Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge.lnk') -Force -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName 'CoworkBridge-Sync' -Confirm:$false -ErrorAction SilentlyContinue; Get-Process RealTimeSync -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"""; \
     Flags: runhidden; RunOnceId: "RemoveCoworkBridgeSync"
