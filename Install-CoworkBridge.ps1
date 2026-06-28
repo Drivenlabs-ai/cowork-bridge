@@ -47,6 +47,13 @@ $script:DiskMarginBytes = [long]5 * 1GB          # laisser au moins ça de libre
 $script:LogFile     = $null
 $script:Repo        = 'Drivenlabs-ai/cowork-bridge'
 
+# Drapeaux bisync statiques (sûreté + perf + log-level) : SOURCE UNIQUE, partagée mot pour
+# mot entre Get-BisyncArgLine (installeur) et l'agent résident (sérialisée dans sync-agent.ps1
+# à la génération). Tokens littéraux uniquement, aucune valeur par-run. Modifier ici = les deux suivent.
+$script:BisyncSafetyFlags   = @('--max-delete', '25', '--conflict-resolve', 'none')
+$script:BisyncPerfFlags     = @('--checkers', '4', '--transfers', '4', '--resilient', '--recover', '--max-lock', '2m')
+$script:BisyncLogLevelFlags = @('--log-level', 'INFO')
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName Microsoft.VisualBasic
@@ -308,14 +315,12 @@ function Get-BisyncArgLine {
         'bisync', (& $q $DrivePath), (& $q $LocalPath),
         '--workdir', (& $q $workdir),
         '--filters-file', (& $q $filters),
-        '--check-access', '--check-filename', $script:MarkerName,
-        '--max-delete', '25',
-        '--conflict-resolve', 'none',
-        '--backup-dir2', (& $q $backup),
-        '--checkers', '4', '--transfers', '4',   # concurrence basse (rclone.org : baisser --checkers sur backend lent) ; valeur à valider sur Windows
-        '--resilient', '--recover', '--max-lock', '2m',
-        '--log-file', (& $q $log), '--log-level', 'INFO'
-    )
+        '--check-access', '--check-filename', $script:MarkerName
+    ) + $script:BisyncSafetyFlags + @(
+        '--backup-dir2', (& $q $backup)
+    ) + $script:BisyncPerfFlags + @(   # concurrence basse (rclone.org : baisser --checkers sur backend lent) ; valeur à valider sur Windows
+        '--log-file', (& $q $log)
+    ) + $script:BisyncLogLevelFlags
     # path1 (Drive fait foi) à l'install ; 'newer' à la migration FFS->rclone pour préserver
     # une édition locale plus récente que FFS n'avait pas encore poussée (sinon Drive l'écrase).
     if ($Resync) { $parts += @('--resync', '--resync-mode', $ResyncMode) }
@@ -360,6 +365,12 @@ function Set-SyncAgent {
         $rcLit   = $RcloneExe.Replace("'", "''")
         $metaLit = $MetaDir.Replace("'", "''")
         $markLit = $script:MarkerName.Replace("'", "''")
+        # Mêmes drapeaux statiques que Get-BisyncArgLine, sérialisés en littéraux PowerShell
+        # ('flag', 'flag', ...) interpolés DANS le here-string (bare $, à la génération) — pas
+        # d'escape backtick : ces tokens ne contiennent ni $ ni guillemet (constantes internes).
+        $safetyLit = ($script:BisyncSafetyFlags   | ForEach-Object { "'$_'" }) -join ', '
+        $perfLit   = ($script:BisyncPerfFlags     | ForEach-Object { "'$_'" }) -join ', '
+        $logLvlLit = ($script:BisyncLogLevelFlags | ForEach-Object { "'$_'" }) -join ', '
         $agentPs = Join-Path $MetaDir 'sync-agent.ps1'
         $agent = @"
 # Cowork Bridge - agent de synchro (genere automatiquement, ne pas editer)
@@ -407,11 +418,9 @@ function Run-All {
         `$pairState = Join-Path `$stateDir (`$p.Name + '.synced')
         `$argLine = @('bisync', ('"{0}"' -f `$p.Drive), ('"{0}"' -f `$p.Local),
             '--workdir', ('"{0}"' -f `$stateDir), '--filters-file', ('"{0}"' -f `$filters),
-            '--check-access', '--check-filename', `$marker, '--max-delete', '25',
-            '--conflict-resolve', 'none', '--backup-dir2', ('"{0}"' -f `$backup),
-            '--checkers', '4', '--transfers', '4',
-            '--resilient', '--recover', '--max-lock', '2m',
-            '--log-file', ('"{0}"' -f `$log), '--log-level', 'INFO')
+            '--check-access', '--check-filename', `$marker, $safetyLit,
+            '--backup-dir2', ('"{0}"' -f `$backup), $perfLit,
+            '--log-file', ('"{0}"' -f `$log), $logLvlLit)
         if (-not (Test-Path `$pairState)) { `$argLine += @('--resync', '--resync-mode', 'path1') }
         `$argLine = `$argLine -join ' '
         try {
