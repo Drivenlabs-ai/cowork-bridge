@@ -1,12 +1,15 @@
 name: Build & release installer
 
-# Compile l'installeur Inno (.exe) sur un runner Windows et publie une Release
-# GitHub à CHAQUE push sur main. Version par date (YYYY.M.D.N), checksum SHA256.
-# L'app installée vérifie ensuite "releases/latest" et se met à jour seule.
+# Compile l'installeur Inno (.exe) sur un runner Windows.
+#  - push main : build + Release GitHub (version par date, checksum SHA256) -> auto-update.
+#  - pull_request : build + artefact téléchargeable SEULEMENT (aucune release) -> permet
+#    de tester un exe de PR sans l'expédier aux clients.
 # (Pas de signature ici : intégrité par checksum ; signature ajoutable plus tard.)
 
 on:
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
   workflow_dispatch:
 
@@ -37,6 +40,27 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Version: $V"
 
+      - name: Bundle rclone (MIT, checksum vérifié)
+        shell: pwsh
+        run: |
+          $ver  = '1.74.3'                       # version épinglée (auditée)
+          $zip  = "rclone-v$ver-windows-amd64.zip"
+          $base = "https://downloads.rclone.org/v$ver"
+          Invoke-WebRequest "$base/$zip" -OutFile $zip -UseBasicParsing
+          Invoke-WebRequest "$base/SHA256SUMS" -OutFile rclone-SHA256SUMS -UseBasicParsing
+          $line = Select-String -Path rclone-SHA256SUMS -SimpleMatch $zip | Select-Object -First 1
+          if (-not $line) { throw "Hash introuvable pour $zip dans SHA256SUMS" }
+          $expected = ($line.Line -split '\s+')[0].ToLower()
+          $actual   = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($expected -ne $actual) { throw "Checksum rclone invalide: $actual != $expected" }
+          Expand-Archive $zip -DestinationPath rclone-extract -Force
+          Copy-Item (Get-ChildItem rclone-extract -Recurse -Filter rclone.exe | Select-Object -First 1).FullName -Destination rclone.exe -Force
+          # Le zip rclone ne contient PAS la licence -> on récupère COPYING (MIT) depuis
+          # le repo au tag exact (obligation MIT : joindre la notice). Build cassé si absente.
+          Invoke-WebRequest "https://raw.githubusercontent.com/rclone/rclone/v$ver/COPYING" -OutFile rclone-LICENSE.txt -UseBasicParsing
+          if (-not (Test-Path rclone-LICENSE.txt)) { throw "Notice MIT rclone introuvable" }
+          Write-Host "rclone $ver bundlé (checksum OK: $actual)"
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --version=6.7.1 -y --no-progress
@@ -58,7 +82,17 @@ jobs:
           "$h  CoworkBridge-Setup.exe" | Out-File -FilePath Output\CHECKSUM -Encoding ascii -NoNewline
           Write-Host "SHA256: $h"
 
+      - name: Upload artifact (test build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoworkBridge-Setup-${{ steps.ver.outputs.version }}
+          path: |
+            Output/CoworkBridge-Setup.exe
+            Output/CHECKSUM
+          if-no-files-found: error
+
       - name: Create or update release
+        if: github.event_name == 'push'   # release seulement sur push main, jamais sur PR
         shell: pwsh
         run: |
           $tag = "v${{ steps.ver.outputs.version }}"
