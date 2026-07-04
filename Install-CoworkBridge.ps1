@@ -16,12 +16,16 @@
           * timer toutes les N min -> pull régulier ;
           * mono-instance (boucle mono-thread), relit config + intervalle à chaud,
             écrit _bridge\next-sync pour le minuteur.
-      - 1er run d'une paire = rclone bisync --resync --resync-mode path1 (Drive fait
-        foi, union, jamais d'effacement Drive).
+      - Resync (1er run d'une paire, récupération après abort critique, filtres
+        modifiés) = rclone bisync --resync --resync-mode newer : union (jamais
+        d'effacement Drive), la version la plus récente gagne — au 1er run le local
+        est vide, donc Drive fait foi de fait.
       - Sûreté : --check-access (marqueur .coworkbridge-ok des deux côtés),
         --max-delete 25, --conflict-resolve none (garde les 2 versions),
         --backup-dir local daté (équivalent corbeille) + corbeille Drive native,
-        --resilient --recover --max-lock 2m.
+        --resilient --recover --max-lock 2m, rotation du journal rclone.log.
+      - Observabilité : statut par paire dans _bridge\status\<nom>.json (agent +
+        panneau) ; le panneau affiche l'état réel de la dernière synchro.
 
     Sécurité disque : avant d'ajouter un dossier, on vérifie qu'il tient sur C:
     avec une marge (sinon remplir le profil empêche Windows de l'ouvrir).
@@ -41,18 +45,65 @@ $script:HomeRoot    = $env:USERPROFILE
 $script:DefaultDest = Join-Path $script:HomeRoot 'CoworkWork'
 $script:MetaDirName = '_bridge'
 $script:OldTaskName = 'CoworkBridge-Sync'        # ancien mécanisme : nettoyé seulement
+$script:WatchdogTaskName = 'CoworkBridge-Watchdog'   # tâche per-user : relance l'agent (logon + horaire)
 $script:MarkerName  = '.coworkbridge-ok'         # marqueur --check-access (anti côté vide)
 $script:DefaultInterval = 30
 $script:DiskMarginBytes = [long]5 * 1GB          # laisser au moins ça de libre sur C:
 $script:LogFile     = $null
 $script:Repo        = 'Drivenlabs-ai/cowork-bridge'
 
-# Drapeaux bisync statiques (sûreté + perf + log-level) : SOURCE UNIQUE, partagée mot pour
+# Drapeaux bisync statiques (sûreté + perf + log) : SOURCE UNIQUE, partagée mot pour
 # mot entre Get-BisyncArgLine (installeur) et l'agent résident (sérialisée dans sync-agent.ps1
 # à la génération). Tokens littéraux uniquement, aucune valeur par-run. Modifier ici = les deux suivent.
 $script:BisyncSafetyFlags   = @('--max-delete', '25', '--conflict-resolve', 'none')
-$script:BisyncPerfFlags     = @('--checkers', '4', '--transfers', '4', '--resilient', '--recover', '--max-lock', '2m')
-$script:BisyncLogLevelFlags = @('--log-level', 'INFO')
+# --local-no-preallocate : la préallocation Windows de rclone arrondit la taille au secteur ; la
+# projection Google Drive Desktop rapporte alors la taille préallouée (octets NULL en fin) -> abort
+# « corrupted on transfer: sizes differ » (rclone #3207, flag officiel v1.55). --local-no-check-updated :
+# un placeholder qui s'hydrate pendant la lecture change de stat apparent -> « can't copy - source file
+# is being updated », non retryable ; le run suivant + backup-dir couvrent le vrai fichier en cours
+# d'écriture. --checkers 1 : énumération sérialisée pour ménager le pool noyau de la projection Cloud
+# Files (ERROR 1450) ; --transfers reste à 4 (le débit de copie ne joue pas sur l'énumération).
+# --retries-sleep : espace les retries internes bisync (défaut 0 = immédiat).
+$script:BisyncPerfFlags     = @('--checkers', '1', '--transfers', '4', '--local-no-preallocate', '--local-no-check-updated', '--retries-sleep', '30s', '--resilient', '--recover', '--max-lock', '2m')
+# Rotation intégrée rclone (v1.71+) : borne rclone.log (journal uniquement — aucune limite
+# sur les fichiers synchronisés). Sans elle, croissance infinie dans le profil (risque C: plein).
+$script:BisyncLogFlags      = @('--log-level', 'INFO', '--log-file-max-size', '5M', '--log-file-max-backups', '2')
+
+# Code de sortie SYNTHÉTIQUE « côté Drive non monté » : hors de la plage rclone (0-10, dont 9 =
+# --error-on-no-transfer) pour éviter toute collision. N'est PAS un échec (ni succès) : neutre.
+$script:CodeDriveMissing = 90
+# Seuils de tuning de la récupération : SOURCE UNIQUE, sérialisés dans l'agent (comme les flags).
+# Modifier ici = installeur ET agent suivent. Éviter la dérive entre « Sync now » et le fond.
+$script:RecoveryGateHours    = 24   # 1 auto-resync / 1 auto-force max par paire et par fenêtre
+$script:RecoveryConsecutive  = 2    # nb d'échecs critiques consécutifs avant d'armer une récupération
+$script:FailThrottle         = 3    # au-delà : la paire n'est plus tentée que sur tick d'intervalle
+
+# Filtres de synchro, en DEUX groupes source-unique :
+#  - Volatile = éphémère qui casse la sync (verrous, temp, états FFS) : exclu partout, sync ET désync.
+#  - Dir = artefacts dev (.git, node_modules...) : exclu de la SYNC seulement. À la désync on les REND
+#    au Drive (ils n'existent que localement) avant de recycler le local, sinon on les perdrait.
+$script:VolatileFilterLines = @(
+    '- *.tmp'
+    '- desktop.ini'
+    '- thumbs.db'
+    '- ~$*'
+    '- .~lock.*'
+    '- *.laccdb'
+    '- .tmp.drivedownload/'
+    '- .tmp.driveupload/'
+    '- *.ffs_db*'
+    '- *.ffs_lock'
+    '- *.ffs_batch'
+    '- *.ffs_real'
+    '- *.ffs_tmp'
+)
+$script:DirFilterLines = @(
+    '- __pycache__/'
+    '- .git/'
+    '- node_modules/'
+    '- .venv/'
+    '- venv/'
+)
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -79,8 +130,24 @@ function Write-Log {
 function Get-SyncResultText([int]$code) {
     switch ($code) {
         0       { 'Sync complete. Everything is up to date.' }
+        90      { 'The Google Drive folder is not reachable. Check that Google Drive for desktop is running and signed in, then try again.' }
         default { 'The sync ran into a problem. Try "Sync now" again. If it persists, open the local folder -> _bridge\rclone.log, or contact your Drivenlabs contact.' }
     }
+}
+
+# Agrège les codes d'une passe multi-paires par SÉVÉRITÉ (pas par max numérique : 90 « Drive
+# absent » ne doit pas masquer un abort réel 1/7). Une vraie erreur domine ; 90 seul sinon ; 0.
+function Merge-SyncCodes([int[]]$Codes) {
+    $realErr = 0
+    $missing = $false
+    foreach ($c in $Codes) {
+        if ($c -eq 0) { continue }
+        elseif ($c -eq $script:CodeDriveMissing) { $missing = $true }
+        elseif ($c -gt $realErr) { $realErr = $c }
+    }
+    if ($realErr -ne 0) { return $realErr }
+    if ($missing) { return $script:CodeDriveMissing }
+    return 0
 }
 
 function Remove-ToRecycleBin([string]$Path) {
@@ -260,25 +327,17 @@ function New-FiltersFile([string]$Path) {
     # Exclure les fichiers d'état FreeFileSync : volatils (réécrits en continu) ils font
     # échouer rclone (« corrupted on transfer: sizes differ »). Indispensable pour migrer
     # une ancienne install FFS sans casser la synchro/désync (vu sur la machine de Dylan).
-    $lines = @(
-        '- *.tmp'
-        '- desktop.ini'
-        '- thumbs.db'
-        '- .tmp.drivedownload/'
-        '- .tmp.driveupload/'
-        '- *.ffs_db*'
-        '- *.ffs_lock'
-        '- *.ffs_batch'
-        '- *.ffs_real'
-        '- *.ffs_tmp'
-        '- __pycache__/'
-        '- .git/'
-        '- node_modules/'
-        '- .venv/'
-        '- venv/'
-    )
+    # Fichiers verrous volatils (Office/LibreOffice/Access) : réécrits en permanence -> mêmes
+    # « corrupted on transfer » que les fichiers d'état FFS. Les exclure évite cette churn côté sync.
+    # Volatile + Dir concaténés -> contenu IDENTIQUE à avant (aucun resync spurieux au split).
+    $lines = @($script:VolatileFilterLines) + @($script:DirFilterLines)
     $content = ($lines -join "`r`n")
     $enc = New-Object System.Text.UTF8Encoding($false)
+    # Retourne $true si le contenu change (fichier absent ou différent) : bisync hash le
+    # filters-file (<filters>.md5) et abort « filters file has changed (must run --resync) »
+    # à chaque run sinon -> l'appelant doit alors invalider les baselines (Reset-PairBaselines).
+    # Skip si identique : pas d'écriture, pas de churn.
+    try { if ((Test-Path $Path) -and ([System.IO.File]::ReadAllText($Path) -eq $content)) { return $false } } catch {}
     # Écriture atomique : l'agent résident peut lire filters.txt en plein bisync (--filters-file).
     # Temp + Replace évite qu'il tombe sur un fichier tronqué ; repli sur écriture directe si besoin.
     try {
@@ -286,8 +345,33 @@ function New-FiltersFile([string]$Path) {
         [System.IO.File]::WriteAllText($tmp, $content, $enc)
         if (Test-Path $Path) { [System.IO.File]::Replace($tmp, $Path, $null) } else { [System.IO.File]::Move($tmp, $Path) }
     } catch {
+        try { Remove-Item "$Path.new" -Force -ErrorAction SilentlyContinue } catch {}
         [System.IO.File]::WriteAllText($Path, $content, $enc)
     }
+    return $true
+}
+
+# Filtre de DÉSYNC : volatile seulement (+ le marqueur). Les dossiers dev (.git, node_modules...)
+# n'existent QUE localement -> on doit les rendre au Drive avant de recycler le local. Retourne le
+# chemin du fichier écrit (dans le workdir, non hashé par bisync).
+function New-DesyncFilterFile([string]$MetaDir) {
+    $lines = @($script:VolatileFilterLines) + @("- $script:MarkerName")
+    $content = ($lines -join "`r`n")
+    $path = Join-Path $MetaDir 'desync-filter.txt'
+    [System.IO.File]::WriteAllText($path, $content, (New-Object System.Text.UTF8Encoding($false)))
+    return $path
+}
+
+# Invalide la baseline de toutes les paires : bisync exige un --resync quand le contenu du
+# filters-file a changé. Baseline absente -> le prochain passage (agent ou Sync now) fait
+# --resync --resync-mode newer (union, la version la plus récente gagne, rien de supprimé),
+# ce qui réécrit aussi le .md5 du filters-file. Purge aussi les jetons de récupération.
+function Reset-PairBaselines([string]$MetaDir) {
+    $stateDir = Join-Path $MetaDir 'bisync-state'
+    if (-not (Test-Path -LiteralPath $stateDir)) { return }
+    Get-ChildItem -LiteralPath $stateDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like '*.synced' -or $_.Name -like '*.resync-pending' -or $_.Name -like '*.force-pending' } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
 # Marqueur d'accès (--check-access) : sa présence des deux côtés prouve que le dossier
@@ -295,7 +379,7 @@ function New-FiltersFile([string]$Path) {
 function Set-Marker([string]$Folder) {
     try {
         $f = Join-Path $Folder $script:MarkerName
-        if (-not (Test-Path $f)) {
+        if (-not (Test-Path -LiteralPath $f)) {
             [System.IO.File]::WriteAllText($f, "Cowork Bridge - marqueur d'acces, ne pas supprimer.", (New-Object System.Text.UTF8Encoding($false)))
         }
     } catch {}
@@ -304,7 +388,7 @@ function Set-Marker([string]$Folder) {
 # Construit la ligne d'arguments rclone bisync pour une paire (chemins entre guillemets ;
 # Assert-SafePath garantit qu'aucun chemin ne contient de guillemet -> pas d'évasion).
 function Get-BisyncArgLine {
-    param([string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$Resync, [string]$ResyncMode = 'path1')
+    param([string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$Resync, [bool]$Force)
     Assert-SafePath $DrivePath; Assert-SafePath $LocalPath; Assert-SafePath $MetaDir
     $workdir = Join-Path $MetaDir 'bisync-state'
     $filters = Join-Path $MetaDir 'filters.txt'
@@ -320,33 +404,273 @@ function Get-BisyncArgLine {
         '--backup-dir2', (& $q $backup)
     ) + $script:BisyncPerfFlags + @(   # concurrence basse (rclone.org : baisser --checkers sur backend lent) ; valeur à valider sur Windows
         '--log-file', (& $q $log)
-    ) + $script:BisyncLogLevelFlags
-    # path1 (Drive fait foi) à l'install ; 'newer' à la migration FFS->rclone pour préserver
-    # une édition locale plus récente que FFS n'avait pas encore poussée (sinon Drive l'écrase).
-    if ($Resync) { $parts += @('--resync', '--resync-mode', $ResyncMode) }
+    ) + $script:BisyncLogFlags
+    # 'newer' : resync en union (jamais de suppression), la version la plus récente gagne.
+    # Premier run d'une paire : le local vient d'être créé (vide) -> équivalent « Drive fait foi » ;
+    # récupération (filtres changés, abort critique) : préserve l'édition locale la plus récente.
+    if ($Resync) { $parts += @('--resync', '--resync-mode', 'newer') }
+    # --force = assumer un run dont les suppressions dépassent --max-delete (réorganisation
+    # Cowork réelle, confirmée par 2 signaux consécutifs). No-op s'il n'y a pas d'excès.
+    elseif ($Force) { $parts += '--force' }
     return ($parts -join ' ')
 }
 
 # Lance une synchro bisync sur une paire. Retourne le code de sortie rclone (0 = ok).
 function Invoke-Bisync {
-    param([string]$RcloneExe, [string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$Resync, [string]$ResyncMode = 'path1')
-    $argLine = Get-BisyncArgLine -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $Resync -ResyncMode $ResyncMode
+    param([string]$RcloneExe, [string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$Resync, [bool]$Force)
+    $argLine = Get-BisyncArgLine -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $Resync -Force $Force
     $p = Start-Process -FilePath $RcloneExe -ArgumentList $argLine -WindowStyle Hidden -PassThru -Wait
-    Write-Log "bisync '$LocalName' (resync=$Resync) code $($p.ExitCode)"
+    Write-Log "bisync '$LocalName' (resync=$Resync force=$Force) code $($p.ExitCode)"
     return [int]$p.ExitCode
 }
 
+# ---- Statut de synchro par paire : _bridge\status\<name>.json ----
+# Écrit par l'agent ET par Sync-Pair (panneau) — même forme JSON dans les deux (l'agent a sa
+# copie autonome dans le here-string). Lu par le panneau (santé) et par le support à distance.
+function Get-StatusField([object]$Obj, [string]$Name, $Default) {
+    if ($Obj -and ($Obj.PSObject.Properties.Name -contains $Name) -and $null -ne $Obj.$Name) { return $Obj.$Name }
+    return $Default
+}
+
+function Read-SyncStatus([string]$MetaDir, [string]$LocalName) {
+    # -LiteralPath : LocalName peut contenir [ ] (légaux sous Windows, wildcards pour PowerShell)
+    $f = Join-Path (Join-Path $MetaDir 'status') ($LocalName + '.json')
+    if (-not (Test-Path -LiteralPath $f)) { return $null }
+    try { return (Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
+
+function Write-SyncStatus([string]$MetaDir, [string]$LocalName, [int]$Code, [bool]$MarkAutoResync = $false, [bool]$MarkAutoForce = $false, [bool]$DeleteSignal = $false) {
+    # Mutex nommé : agent et panneau font tous deux un read-modify-write du MÊME fichier ; l'écriture
+    # atomique (temp+Replace) évite un fichier tronqué mais pas une mise à jour perdue (un succès vert
+    # réécrasé en rouge, une gate 24 h désarmée). Le lock sérialise le read+write. Best-effort (2 s).
+    $mtx = New-Object System.Threading.Mutex($false, 'Local\CoworkBridge-Status')
+    $held = $false
+    try { $held = $mtx.WaitOne(2000) } catch [System.Threading.AbandonedMutexException] { $held = $true } catch { $held = $false }
+    try {
+        $dir = Join-Path $MetaDir 'status'
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $old = Read-SyncStatus -MetaDir $MetaDir -LocalName $LocalName
+        $now = (Get-Date).ToString('o')
+        # ConvertFrom-Json rend les dates ISO en [datetime] selon l'hôte (PS7 ; PS 5.1 les laisse
+        # en chaîne) : re-normaliser en chaîne 'o' pour un JSON portable dans les deux cas.
+        $lastSuccess = Get-StatusField $old 'lastSuccess' $null
+        if ($lastSuccess -is [datetime]) { $lastSuccess = $lastSuccess.ToString('o') }
+        # 'Drive absent' (sentinelle) = NEUTRE : ni succès ni échec -> failures inchangé (pas de
+        # faux rouge au boot, pas de blocage FSW). Succès -> 0 ; vraie erreur -> +1.
+        $failures = [int](Get-StatusField $old 'failures' 0)
+        if ($Code -eq 0) { $lastSuccess = $now; $failures = 0 }
+        elseif ($Code -eq $script:CodeDriveMissing) { }
+        else { $failures = $failures + 1 }
+        $lastAuto = Get-StatusField $old 'lastAutoResync' $null
+        if ($lastAuto -is [datetime]) { $lastAuto = $lastAuto.ToString('o') }
+        if ($MarkAutoResync) { $lastAuto = $now }
+        # deleteAborts = signaux « too many deletes » consécutifs (remis à 0 dès qu'un run n'en émet pas)
+        $deleteAborts = 0
+        if ($DeleteSignal) { $deleteAborts = 1 + [int](Get-StatusField $old 'deleteAborts' 0) }
+        $lastForce = Get-StatusField $old 'lastAutoForce' $null
+        if ($lastForce -is [datetime]) { $lastForce = $lastForce.ToString('o') }
+        if ($MarkAutoForce) { $lastForce = $now }
+        $st = [pscustomobject]@{
+            name = $LocalName; lastRun = $now; lastExit = $Code
+            lastSuccess = $lastSuccess; failures = $failures; lastAutoResync = $lastAuto
+            deleteAborts = $deleteAborts; lastAutoForce = $lastForce
+        }
+        $out  = Join-Path $dir ($LocalName + '.json')
+        $json = ConvertTo-Json -InputObject $st
+        $enc  = New-Object System.Text.UTF8Encoding($false)
+        try {
+            $tmp = "$out.new"
+            [System.IO.File]::WriteAllText($tmp, $json, $enc)
+            if (Test-Path -LiteralPath $out) { [System.IO.File]::Replace($tmp, $out, $null) } else { [System.IO.File]::Move($tmp, $out) }
+        } catch { [System.IO.File]::WriteAllText($out, $json, $enc) }
+    } catch {} finally {
+        if ($held) { try { $mtx.ReleaseMutex() } catch {} }
+        $mtx.Dispose()
+    }
+}
+
+# Longueur actuelle de rclone.log (offset à capturer AVANT un run) : 0 si absent.
+function Get-LogOffset([string]$MetaDir) {
+    try {
+        $log = Join-Path $MetaDir 'rclone.log'
+        if (Test-Path -LiteralPath $log) { return (Get-Item -LiteralPath $log).Length }
+    } catch {}
+    return [long]0
+}
+
+# Détecte l'abort « too many deletes » (garde --max-delete) du run qui vient de s'achever : il sort
+# en exit 1 (jamais 7, vérifié source rclone) -> indétectable par le code seul. On ne scanne QUE les
+# octets ajoutés par CE run (de $FromOffset à la fin), donc strictement par paire (log partagé) et
+# insensible à la rotation (si le fichier a rétréci, on repart de 0). Le motif texte reste fragile
+# (dépend du libellé rclone) -> à confirmer sur Windows. Faux positif bénin : --force sans excès = no-op.
+function Test-MaxDeleteSignal([string]$MetaDir, [long]$FromOffset) {
+    try {
+        $log = Join-Path $MetaDir 'rclone.log'
+        if (-not (Test-Path -LiteralPath $log)) { return $false }
+        $fs = [System.IO.File]::Open($log, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $start = $FromOffset
+            if ($start -gt $fs.Length -or $start -lt 0) { $start = 0 }   # rotation -> nouveau fichier
+            # Région démesurée = rotation en plein run puis re-croissance (l'offset ne veut plus rien
+            # dire) : borne au dernier Mo. L'abort « too many deletes » est émis en fin de run -> la
+            # queue le capture, et la mémoire reste bornée.
+            $cap = [long]1MB
+            if (($fs.Length - $start) -gt $cap) { $start = $fs.Length - $cap }
+            $len = [int]($fs.Length - $start)
+            if ($len -le 0) { return $false }
+            [void]$fs.Seek($start, [System.IO.SeekOrigin]::Begin)
+            $buf = New-Object byte[] $len
+            $read = 0
+            while ($read -lt $len) {
+                $n = $fs.Read($buf, $read, $len - $read)
+                if ($n -le 0) { break }
+                $read += $n
+            }
+        } finally { $fs.Close() }
+        $txt = [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
+        return ($txt -match 'too many deletes')
+    } catch {}
+    return $false
+}
+
+function Format-Ago([datetime]$T) {
+    $d = (Get-Date) - $T
+    if ($d.TotalMinutes -lt 1) { return 'just now' }
+    if ($d.TotalHours -lt 1)   { return ('{0} min ago' -f [int][math]::Floor($d.TotalMinutes)) }
+    if ($d.TotalDays -lt 1)    { return ('{0} h ago' -f [int][math]::Floor($d.TotalHours)) }
+    return ('{0} d ago' -f [int][math]::Floor($d.TotalDays))
+}
+
+# Agrège les statuts par paire pour le panneau : $null si aucune donnée (install neuve), sinon
+# @{ Ok; Text }. États ORDONNÉS du plus au moins grave : agent arrêté (stale) > FAILING (erreur
+# réelle, échecs consécutifs) > waiting-Drive (sentinelle) > retrying (1er échec, se répare) > OK.
+# Le vert n'est réservé qu'aux paires réellement à 0 (pas d'un « OK » rassurant sur une paire qui
+# vient d'échouer). $IntervalMin passé par l'appelant -> pas de relecture disque à chaque tick.
+function Get-BridgeHealth([string]$MetaDir, [object[]]$Sources, [int]$IntervalMin = 30) {
+    $worstFail = $null; $oldestOk = $null; $newestRun = $null; $missing = $false; $retrying = $false
+    foreach ($s in $Sources) {
+        $st = Read-SyncStatus -MetaDir $MetaDir -LocalName (Resolve-LocalName $s)
+        if (-not $st) { continue }
+        $lr = Get-StatusField $st 'lastRun' $null
+        if ($lr) { try { $t = [datetime]$lr; if (-not $newestRun -or $t -gt $newestRun) { $newestRun = $t } } catch {} }
+        $code  = [int](Get-StatusField $st 'lastExit' 0)
+        $fails = [int](Get-StatusField $st 'failures' 0)
+        if ($code -eq 0) {
+            $ls = Get-StatusField $st 'lastSuccess' $null
+            if ($ls) { try { $t = [datetime]$ls; if (-not $oldestOk -or $t -lt $oldestOk) { $oldestOk = $t } } catch {} }
+        } elseif ($code -eq $script:CodeDriveMissing) {
+            $missing = $true
+        } elseif ($fails -ge $script:RecoveryConsecutive) {
+            if (-not $worstFail -or $fails -gt [int](Get-StatusField $worstFail 'failures' 0)) { $worstFail = $st }
+        } else {
+            $retrying = $true   # erreur réelle mais 1er échec : pas encore alarmant
+        }
+    }
+    # Aucun run depuis longtemps = agent probablement arrêté (crash, raccourci/tâche supprimés) :
+    # une santé verte serait périmée. Priorité maximale (plus rien ne se synchronise).
+    if ($newestRun) {
+        $mins = if ($IntervalMin -lt 1) { 1 } else { $IntervalMin }
+        if (((Get-Date) - $newestRun).TotalMinutes -gt [math]::Max(3 * $mins, 90)) {
+            # Kind='stale' : l'appelant suppresse ce verdict pendant une courte grâce au démarrage
+            # (au boot l'agent vient d'être relancé mais n'a pas encore écrit de statut).
+            return @{ Ok = $false; Kind = 'stale'; Text = ('no sync since {0} - the background agent may be stopped, close and reopen this app' -f (Format-Ago $newestRun)) }
+        }
+    }
+    if ($worstFail) {
+        $n = Get-StatusField $worstFail 'name' '?'
+        $c = [int](Get-StatusField $worstFail 'failures' 0)
+        $ls = Get-StatusField $worstFail 'lastSuccess' $null
+        $since = 'never synced'
+        if ($ls) { try { $since = 'last success ' + (Format-Ago ([datetime]$ls)) } catch {} }
+        return @{ Ok = $false; Text = ('Sync FAILING: {0} ({1} tries, {2})' -f $n, $c, $since) }
+    }
+    if ($missing)  { return @{ Ok = $false; Text = 'waiting for Google Drive to start' } }
+    if ($retrying) { return @{ Ok = $false; Text = 'syncing (retrying)...' } }
+    if ($oldestOk) { return @{ Ok = $true;  Text = ('last sync OK ({0})' -f (Format-Ago $oldestOk)) } }
+    return $null
+}
+
 # Synchronise une paire en gérant sa baseline : --resync si la paire n'a jamais été
-# synchronisée (marqueur absent), sinon bisync normal. Marqueur posé après un run à 0.
-# Indispensable : une paire neuve SANS --resync fait sortir bisync en erreur.
+# synchronisée (marqueur absent) ou si un jeton de récupération est posé, sinon bisync
+# normal. Marqueur posé après un run à 0. Une paire neuve SANS --resync sort en erreur.
+# Récupération : exit 7 = abort critique bisync (« Must run --resync to recover ») -> jeton
+# one-shot .resync-pending, au plus 1 fois par 24 h (pas de tempête de resyncs). Le jeton est
+# consommé que le resync réussisse ou non. Exit 1 + signal « too many deletes » -> jeton
+# one-shot .force-pending (mêmes gardes). Même logique dans l'agent (Run-All).
 function Sync-Pair {
-    param([object]$Rclone, [string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$ForceResync, [string]$ResyncMode = 'path1')
+    param([object]$Rclone, [string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$ForceResync, [bool]$Manual)
     $stateDir = Join-Path $MetaDir 'bisync-state'
-    if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
-    $pairState = Join-Path $stateDir ($LocalName + '.synced')
-    $resync = $ForceResync -or -not (Test-Path $pairState)
-    $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $resync -ResyncMode $ResyncMode
-    if ($code -eq 0) { New-Item -ItemType File -Path $pairState -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
+    # Côté Drive absent (Drive Desktop pas monté / démarré) : pas de run -> pas d'exit 7 transitoire
+    # ni de jeton injustifié. Code sentinelle « Drive absent » (neutre, message ciblé au panneau).
+    if (-not (Test-Path -LiteralPath $DrivePath)) {
+        Write-SyncStatus -MetaDir $MetaDir -LocalName $LocalName -Code $script:CodeDriveMissing -MarkAutoResync $false
+        return $script:CodeDriveMissing
+    }
+    # -LiteralPath sur tout chemin dérivé de LocalName : [ ] y sont légaux mais globbent en PowerShell
+    $pairState  = Join-Path $stateDir ($LocalName + '.synced')
+    $pending    = Join-Path $stateDir ($LocalName + '.resync-pending')
+    $forceTok   = Join-Path $stateDir ($LocalName + '.force-pending')
+    $offset = Get-LogOffset $MetaDir
+
+    # « Sync now » manuel = override humain : escalade INLINE sans passer par les jetons ni les
+    # gates 24 h/consécutif (le clic EST la confirmation). Un run ; si abort critique -> resync ;
+    # si too-many-deletes -> force ; on rend le code final tout de suite, débloque un état coincé.
+    if ($Manual) {
+        $resync = $ForceResync -or -not (Test-Path -LiteralPath $pairState)
+        $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $resync -Force $false
+        if ($code -eq 7 -and -not $resync) {
+            $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $true -Force $false
+        } elseif ($code -eq 1 -and (Test-MaxDeleteSignal -MetaDir $MetaDir -FromOffset $offset)) {
+            $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $false -Force $true
+        }
+        if ($code -eq 0) {
+            New-Item -ItemType File -Path $pairState -Force | Out-Null
+            # État résolu : d'éventuels jetons armés par l'agent sont moot -> évite un double run.
+            Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $forceTok -Force -ErrorAction SilentlyContinue
+        }
+        Write-SyncStatus -MetaDir $MetaDir -LocalName $LocalName -Code $code
+        return $code
+    }
+
+    # Chemin automatique (Apply-Config, agent) : jetons + gates anti-tempête.
+    $hadPending = Test-Path -LiteralPath $pending
+    $hadForce   = Test-Path -LiteralPath $forceTok
+    $resync  = $ForceResync -or $hadPending -or -not (Test-Path -LiteralPath $pairState)
+    $useForce = ($hadForce -and -not $resync)
+    $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $resync -Force $useForce
+    if ($hadPending) { Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue }
+    # Jeton force conservé si un resync a pris le pas (il n'a PAS été appliqué) -> il servira au run suivant.
+    if ($useForce)   { Remove-Item -LiteralPath $forceTok -Force -ErrorAction SilentlyContinue }
+    $mark = $false; $markForce = $false; $delSig = $false
+    if ($code -eq 0) {
+        New-Item -ItemType File -Path $pairState -Force | Out-Null
+    } elseif ($code -eq 7 -and -not $hadPending -and (Test-Path -LiteralPath $pairState)) {
+        # Armer au Ne exit 7 CONSÉCUTIF seulement : une collision de verrou ponctuelle
+        # (Sync now + agent sur la même paire, --max-lock) ne déclenche pas de resync injustifié.
+        $prev  = Read-SyncStatus -MetaDir $MetaDir -LocalName $LocalName
+        $again = ([int](Get-StatusField $prev 'lastExit' 0) -eq 7)
+        $last  = Get-StatusField $prev 'lastAutoResync' $null
+        $ok24  = $true
+        if ($last) { try { $ok24 = ((Get-Date) - [datetime]$last).TotalHours -ge $script:RecoveryGateHours } catch {} }
+        if ($again -and $ok24) { New-Item -ItemType File -Path $pending -Force | Out-Null; $mark = $true }
+    } elseif ($code -eq 1 -and -not $useForce) {
+        # « too many deletes » (réorganisation Cowork : déplacement = suppression + création).
+        # Armé au Ne signal consécutif (un glitch de projection fluctue, une réorganisation
+        # persiste) ; suppressions récupérables : corbeille Drive + backup-dir2 local. 1x/fenêtre.
+        $delSig = Test-MaxDeleteSignal -MetaDir $MetaDir -FromOffset $offset
+        if ($delSig) {
+            $prev  = Read-SyncStatus -MetaDir $MetaDir -LocalName $LocalName
+            $lastF = Get-StatusField $prev 'lastAutoForce' $null
+            $okF   = $true
+            if ($lastF) { try { $okF = ((Get-Date) - [datetime]$lastF).TotalHours -ge $script:RecoveryGateHours } catch {} }
+            if (([int](Get-StatusField $prev 'deleteAborts' 0) -ge ($script:RecoveryConsecutive - 1)) -and $okF) {
+                New-Item -ItemType File -Path $forceTok -Force | Out-Null; $markForce = $true
+            }
+        }
+    }
+    Write-SyncStatus -MetaDir $MetaDir -LocalName $LocalName -Code $code -MarkAutoResync $mark -MarkAutoForce $markForce -DeleteSignal $delSig
     return $code
 }
 
@@ -368,13 +692,27 @@ function Set-SyncAgent {
         # Mêmes drapeaux statiques que Get-BisyncArgLine, sérialisés en littéraux PowerShell
         # ('flag', 'flag', ...) interpolés DANS le here-string (bare $, à la génération) — pas
         # d'escape backtick : ces tokens ne contiennent ni $ ni guillemet (constantes internes).
-        $safetyLit = ($script:BisyncSafetyFlags   | ForEach-Object { "'$_'" }) -join ', '
-        $perfLit   = ($script:BisyncPerfFlags     | ForEach-Object { "'$_'" }) -join ', '
-        $logLvlLit = ($script:BisyncLogLevelFlags | ForEach-Object { "'$_'" }) -join ', '
+        $safetyLit = ($script:BisyncSafetyFlags | ForEach-Object { "'$_'" }) -join ', '
+        $perfLit   = ($script:BisyncPerfFlags   | ForEach-Object { "'$_'" }) -join ', '
+        $logLit    = ($script:BisyncLogFlags    | ForEach-Object { "'$_'" }) -join ', '
+        # Constantes de tuning : SOURCE UNIQUE, interpolées en littéraux numériques dans l'agent
+        # (bare $, à la génération) -> l'installeur et l'agent ne peuvent plus diverger sur ces seuils.
+        $codeMissingLit = [int]$script:CodeDriveMissing
+        $gateHoursLit   = [int]$script:RecoveryGateHours
+        $consecLit      = [int]$script:RecoveryConsecutive
+        $throttleLit    = [int]$script:FailThrottle
         $agentPs = Join-Path $MetaDir 'sync-agent.ps1'
         $agent = @"
 # Cowork Bridge - agent de synchro (genere automatiquement, ne pas editer)
 Set-StrictMode -Version Latest
+# Mono-instance : le chien de garde (tache planifiee) relance l'agent au logon + toutes les
+# heures ; si un agent tourne deja, celui-ci sort immediatement. AbandonedMutex = le detenteur
+# precedent est mort sans liberer -> la propriete nous revient (acquis). Toute autre exception :
+# on demarre quand meme (--max-lock reste le garde-fou secondaire contre deux bisync concurrents).
+`$script:mtx = New-Object System.Threading.Mutex(`$false, 'Local\CoworkBridge-SyncAgent')
+`$got = `$false
+try { `$got = `$script:mtx.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { `$got = `$true } catch { `$got = `$true }
+if (-not `$got) { exit }
 `$rclone = '$rcLit'
 `$meta   = '$metaLit'
 `$marker = '$markLit'
@@ -407,33 +745,190 @@ function Get-Interval {
     return `$min
 }
 
+# ---- Statut par paire (meta\status\<name>.json) : meme forme JSON que Write-SyncStatus
+# cote installeur. Lu par le panneau (sante) et le support a distance. ----
+function Get-Field(`$o, [string]`$n, `$d) {
+    if (`$o -and (`$o.PSObject.Properties.Name -contains `$n) -and `$null -ne `$o.`$n) { return `$o.`$n }
+    return `$d
+}
+
+function Read-Status([string]`$name) {
+    # -LiteralPath : le nom de paire peut contenir [ ] (legaux sous Windows, wildcards PowerShell)
+    `$f = Join-Path (Join-Path `$meta 'status') (`$name + '.json')
+    if (-not (Test-Path -LiteralPath `$f)) { return `$null }
+    try { return (Get-Content -LiteralPath `$f -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return `$null }
+}
+
+function Write-Status([string]`$name, [int]`$code, [bool]`$markResync, [bool]`$markForce, [bool]`$deleteSignal) {
+    # Mutex nomme : agent et panneau ecrivent le meme fichier ; serialise le read-modify-write
+    # (l'ecriture atomique seule ne protege pas d'une mise a jour perdue). Best-effort (2 s).
+    `$mtx = New-Object System.Threading.Mutex(`$false, 'Local\CoworkBridge-Status')
+    `$held = `$false
+    try { `$held = `$mtx.WaitOne(2000) } catch [System.Threading.AbandonedMutexException] { `$held = `$true } catch { `$held = `$false }
+    try {
+        `$dir = Join-Path `$meta 'status'
+        if (-not (Test-Path -LiteralPath `$dir)) { New-Item -ItemType Directory -Path `$dir -Force | Out-Null }
+        `$old = Read-Status `$name
+        `$now = (Get-Date).ToString('o')
+        # ConvertFrom-Json rend les dates ISO en [datetime] selon l'hote (PS7 ; PS 5.1 = chaine) : re-normaliser en 'o'
+        `$lastSuccess = Get-Field `$old 'lastSuccess' `$null
+        if (`$lastSuccess -is [datetime]) { `$lastSuccess = `$lastSuccess.ToString('o') }
+        # sentinelle Drive absent = NEUTRE (ni succes ni echec) : failures inchange.
+        `$failures = [int](Get-Field `$old 'failures' 0)
+        if (`$code -eq 0) { `$lastSuccess = `$now; `$failures = 0 }
+        elseif (`$code -eq $codeMissingLit) { }
+        else { `$failures = `$failures + 1 }
+        `$lastAuto = Get-Field `$old 'lastAutoResync' `$null
+        if (`$lastAuto -is [datetime]) { `$lastAuto = `$lastAuto.ToString('o') }
+        if (`$markResync) { `$lastAuto = `$now }
+        `$deleteAborts = 0
+        if (`$deleteSignal) { `$deleteAborts = 1 + [int](Get-Field `$old 'deleteAborts' 0) }
+        `$lastForce = Get-Field `$old 'lastAutoForce' `$null
+        if (`$lastForce -is [datetime]) { `$lastForce = `$lastForce.ToString('o') }
+        if (`$markForce) { `$lastForce = `$now }
+        `$st = [pscustomobject]@{
+            name = `$name; lastRun = `$now; lastExit = `$code
+            lastSuccess = `$lastSuccess; failures = `$failures; lastAutoResync = `$lastAuto
+            deleteAborts = `$deleteAborts; lastAutoForce = `$lastForce
+        }
+        `$out  = Join-Path `$dir (`$name + '.json')
+        `$json = ConvertTo-Json -InputObject `$st
+        `$enc  = New-Object System.Text.UTF8Encoding(`$false)
+        try {
+            `$tmp = "`$out.new"
+            [System.IO.File]::WriteAllText(`$tmp, `$json, `$enc)
+            if (Test-Path -LiteralPath `$out) { [System.IO.File]::Replace(`$tmp, `$out, `$null) } else { [System.IO.File]::Move(`$tmp, `$out) }
+        } catch { [System.IO.File]::WriteAllText(`$out, `$json, `$enc) }
+    } catch {} finally {
+        if (`$held) { try { `$mtx.ReleaseMutex() } catch {} }
+        `$mtx.Dispose()
+    }
+}
+
+# Longueur de rclone.log (offset a capturer AVANT un run) : 0 si absent.
+function Get-LogOffset {
+    try {
+        `$log = Join-Path `$meta 'rclone.log'
+        if (Test-Path -LiteralPath `$log) { return (Get-Item -LiteralPath `$log).Length }
+    } catch {}
+    return [long]0
+}
+
+# Abort « too many deletes » (garde --max-delete) : sort en exit 1 -> indetectable par le code
+# seul. On scanne UNIQUEMENT les octets ajoutes par CE run (de `$fromOffset a la fin) : strictement
+# par paire malgre le log partage, insensible a la rotation (fichier retreci -> depuis 0). Motif
+# texte fragile (libelle rclone) -> a confirmer sur Windows. Faux positif benin : --force = no-op.
+function Test-MaxDelete([long]`$fromOffset) {
+    try {
+        `$log = Join-Path `$meta 'rclone.log'
+        if (-not (Test-Path -LiteralPath `$log)) { return `$false }
+        `$fs = [System.IO.File]::Open(`$log, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            `$start = `$fromOffset
+            if (`$start -gt `$fs.Length -or `$start -lt 0) { `$start = 0 }
+            # region demesuree = rotation en plein run puis re-croissance : borne au dernier Mo
+            # (l'abort est emis en fin de run -> la queue le capture ; memoire bornee)
+            `$cap = [long]1MB
+            if ((`$fs.Length - `$start) -gt `$cap) { `$start = `$fs.Length - `$cap }
+            `$len = [int](`$fs.Length - `$start)
+            if (`$len -le 0) { return `$false }
+            [void]`$fs.Seek(`$start, [System.IO.SeekOrigin]::Begin)
+            `$buf = New-Object byte[] `$len
+            `$read = 0
+            while (`$read -lt `$len) {
+                `$n = `$fs.Read(`$buf, `$read, `$len - `$read)
+                if (`$n -le 0) { break }
+                `$read += `$n
+            }
+        } finally { `$fs.Close() }
+        `$txt = [System.Text.Encoding]::UTF8.GetString(`$buf, 0, `$read)
+        return (`$txt -match 'too many deletes')
+    } catch {}
+    return `$false
+}
+
 function Run-All {
+    param([bool]`$Due)
     `$stateDir = Join-Path `$meta 'bisync-state'
-    if (-not (Test-Path `$stateDir)) { New-Item -ItemType Directory -Path `$stateDir -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath `$stateDir)) { New-Item -ItemType Directory -Path `$stateDir -Force | Out-Null }
     foreach (`$p in (Read-Pairs)) {
-        if (-not (Test-Path `$p.Local)) { continue }
-        `$filters   = Join-Path `$meta 'filters.txt'
-        `$backup    = Join-Path (Join-Path `$meta 'trash') ((Get-Date -Format 'yyyy-MM-dd') + '\' + `$p.Name)
-        `$log       = Join-Path `$meta 'rclone.log'
-        `$pairState = Join-Path `$stateDir (`$p.Name + '.synced')
+        # -LiteralPath sur tout chemin derive du nom de paire ([ ] legaux mais globbent en PowerShell)
+        # Paire en echec repete : cadence intervalle seulement (pas de retry sur evenement FSW) --
+        # sinon une synchro qui echoue en boucle rescanne la projection dos a dos (pression 1450)
+        `$fails = [int](Get-Field (Read-Status `$p.Name) 'failures' 0)
+        if (-not `$Due -and `$fails -ge $throttleLit) { continue }
+        # Un cote absent (Drive pas encore monte au boot, dossier local supprime) : pas de run ->
+        # pas d'exit 7 transitoire ni de jeton injustifie ; sentinelle Drive absent (neutre au panneau)
+        if (-not (Test-Path -LiteralPath `$p.Local) -or -not (Test-Path -LiteralPath `$p.Drive)) { Write-Status `$p.Name $codeMissingLit `$false `$false `$false; continue }
+        `$filters    = Join-Path `$meta 'filters.txt'
+        `$backup     = Join-Path (Join-Path `$meta 'trash') ((Get-Date -Format 'yyyy-MM-dd') + '\' + `$p.Name)
+        `$log        = Join-Path `$meta 'rclone.log'
+        `$pairState  = Join-Path `$stateDir (`$p.Name + '.synced')
+        `$pending    = Join-Path `$stateDir (`$p.Name + '.resync-pending')
+        `$forceTok   = Join-Path `$stateDir (`$p.Name + '.force-pending')
+        `$hadPending = Test-Path -LiteralPath `$pending
+        `$hadForce   = Test-Path -LiteralPath `$forceTok
         `$argLine = @('bisync', ('"{0}"' -f `$p.Drive), ('"{0}"' -f `$p.Local),
             '--workdir', ('"{0}"' -f `$stateDir), '--filters-file', ('"{0}"' -f `$filters),
             '--check-access', '--check-filename', `$marker, $safetyLit,
             '--backup-dir2', ('"{0}"' -f `$backup), $perfLit,
-            '--log-file', ('"{0}"' -f `$log), $logLvlLit)
-        if (-not (Test-Path `$pairState)) { `$argLine += @('--resync', '--resync-mode', 'path1') }
+            '--log-file', ('"{0}"' -f `$log), $logLit)
+        # 'newer' : union, la version la plus recente gagne (premier run : local vide -> Drive fait foi)
+        `$doResync = (`$hadPending -or -not (Test-Path -LiteralPath `$pairState))
+        `$useForce = (`$hadForce -and -not `$doResync)
+        if (`$doResync) { `$argLine += @('--resync', '--resync-mode', 'newer') }
+        elseif (`$useForce) { `$argLine += '--force' }
         `$argLine = `$argLine -join ' '
+        `$offset = Get-LogOffset
+        `$code = -1
         try {
             `$proc = Start-Process -FilePath `$rclone -ArgumentList `$argLine -WindowStyle Hidden -Wait -PassThru
-            if (`$proc.ExitCode -eq 0) { New-Item -ItemType File -Path `$pairState -Force | Out-Null }
+            `$code = [int]`$proc.ExitCode
         } catch {}
+        # jetons one-shot, consommes seulement si rclone a pu demarrer (code -1 = Start-Process a echoue).
+        # Le jeton force est GARDE si un resync a pris le pas (--force pas applique) -> servira au run suivant.
+        if (`$hadPending -and `$code -ne -1) { Remove-Item -LiteralPath `$pending -Force -ErrorAction SilentlyContinue }
+        if (`$useForce -and `$code -ne -1)   { Remove-Item -LiteralPath `$forceTok -Force -ErrorAction SilentlyContinue }
+        `$markResync = `$false; `$markForce = `$false; `$delSig = `$false
+        if (`$code -eq 0) {
+            New-Item -ItemType File -Path `$pairState -Force | Out-Null
+        } elseif (`$code -eq 7 -and -not `$hadPending -and (Test-Path -LiteralPath `$pairState)) {
+            # exit 7 = abort critique bisync (Must run --resync to recover) -> resync de recuperation,
+            # arme au Ne exit 7 CONSECUTIF (une collision de verrou ponctuelle ne declenche rien),
+            # au plus 1 fois par fenetre (pas de tempete de resyncs)
+            `$prev  = Read-Status `$p.Name
+            `$again = ([int](Get-Field `$prev 'lastExit' 0) -eq 7)
+            `$last  = Get-Field `$prev 'lastAutoResync' `$null
+            `$ok24  = `$true
+            if (`$last) { try { `$ok24 = ((Get-Date) - [datetime]`$last).TotalHours -ge $gateHoursLit } catch {} }
+            if (`$again -and `$ok24) {
+                New-Item -ItemType File -Path `$pending -Force | Out-Null
+                `$markResync = `$true
+            }
+        } elseif (`$code -eq 1 -and -not `$useForce) {
+            # too many deletes (reorganisation Cowork : deplacement = suppression + creation).
+            # Arme au Ne signal consecutif (un glitch de projection fluctue, une reorganisation
+            # persiste) ; suppressions recuperables (corbeille Drive + backup-dir2). 1x/fenetre.
+            `$delSig = Test-MaxDelete `$offset
+            if (`$delSig) {
+                `$prev  = Read-Status `$p.Name
+                `$lastF = Get-Field `$prev 'lastAutoForce' `$null
+                `$okF   = `$true
+                if (`$lastF) { try { `$okF = ((Get-Date) - [datetime]`$lastF).TotalHours -ge $gateHoursLit } catch {} }
+                if (([int](Get-Field `$prev 'deleteAborts' 0) -ge ($consecLit - 1)) -and `$okF) {
+                    New-Item -ItemType File -Path `$forceTok -Force | Out-Null
+                    `$markForce = `$true
+                }
+            }
+        }
+        Write-Status `$p.Name `$code `$markResync `$markForce `$delSig
     }
 }
 
 # Watcher : chaque modif locale émet un événement dans la file (récupéré par Wait-Event).
 `$watchers = @()
 foreach (`$p in (Read-Pairs)) {
-    if (-not (Test-Path `$p.Local)) { continue }
+    if (-not (Test-Path -LiteralPath `$p.Local)) { continue }
     try {
         `$w = New-Object System.IO.FileSystemWatcher `$p.Local
         `$w.IncludeSubdirectories = `$true
@@ -455,8 +950,12 @@ while (`$true) {
     `$interval = Get-Interval
     `$due = ((Get-Date) - `$lastRun).TotalMinutes -ge `$interval
     if (`$dirty -or `$due) {
-        Run-All
-        `$lastRun = Get-Date   # APRES Run-All : garantit un temps mort = intervalle, même si la synchro est longue
+        Run-All `$due
+        # Purge la file FSW : les fichiers deposes par le pull declenchaient sinon un second run
+        # (assume : une modif utilisateur faite PENDANT la synchro part au tick suivant --
+        # prefere a un double scan systematique de la projection)
+        Get-Event -ErrorAction SilentlyContinue | Remove-Event -ErrorAction SilentlyContinue
+        `$lastRun = Get-Date   # APRES Run-All : garantit un temps mort = intervalle, meme si la synchro est longue
         try { [System.IO.File]::WriteAllText((Join-Path `$meta 'next-sync'), `$lastRun.AddMinutes(`$interval).ToString('o')) } catch {}
     }
 }
@@ -465,13 +964,35 @@ while (`$true) {
         $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $argLine = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $agentPs
         $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge-Sync.lnk'
-        $wsh = New-Object -ComObject WScript.Shell
-        $sc = $wsh.CreateShortcut($lnk)
-        $sc.TargetPath  = $ps
-        $sc.Arguments   = $argLine
-        $sc.WindowStyle = 7
-        $sc.Description  = 'Cowork Bridge - sync agent'
-        $sc.Save()
+        # Chien de garde : tâche planifiée per-user (sans admin) — logon + toutes les heures,
+        # relance l'agent s'il ne tourne plus (l'agent est mono-instance via mutex). Un simple
+        # raccourci Démarrage ne relançait pas un agent tué en cours de session. Repli .lnk si
+        # la création de tâche est bloquée (GPO).
+        $task = $false
+        try {
+            # Identité via WindowsIdentity : donne le principal correct sur AzureAD/MSA/domaine
+            # (« AzureAD\user », « MACHINE\user »…), là où $env:USERDOMAIN\$env:USERNAME échoue à
+            # résoudre le SID sur les comptes AzureAD. Durée de répétition FINIE (10 ans) plutôt que
+            # [TimeSpan]::MaxValue, rejeté sur les hôtes plus anciens.
+            $me = ([Security.Principal.WindowsIdentity]::GetCurrent()).Name
+            $action  = New-ScheduledTaskAction -Execute $ps -Argument $argLine
+            $trigLog = New-ScheduledTaskTrigger -AtLogOn -User $me
+            $trigRep = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+            # ExecutionTimeLimit 0 = illimité : l'agent est résident, la limite par défaut (72 h) le tuerait
+            $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
+            Register-ScheduledTask -TaskName $script:WatchdogTaskName -Action $action -Trigger @($trigLog, $trigRep) -Settings $set -Force | Out-Null
+            $task = $true
+            if (Test-Path -LiteralPath $lnk) { Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue }
+        } catch { Write-Log "Watchdog task not registered, falling back to Startup shortcut: $($_.Exception.Message)" 'WARN' }
+        if (-not $task) {
+            $wsh = New-Object -ComObject WScript.Shell
+            $sc = $wsh.CreateShortcut($lnk)
+            $sc.TargetPath  = $ps
+            $sc.Arguments   = $argLine
+            $sc.WindowStyle = 7
+            $sc.Description  = 'Cowork Bridge - sync agent'
+            $sc.Save()
+        }
         try { Start-Process -FilePath $ps -ArgumentList $argLine -WindowStyle Hidden | Out-Null } catch {}
         return $true
     } catch {
@@ -481,6 +1002,7 @@ while (`$true) {
 }
 
 function Remove-SyncAgent {
+    try { Unregister-ScheduledTask -TaskName $script:WatchdogTaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
     $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'CoworkBridge-Sync.lnk'
     if (Test-Path $lnk) { Remove-Item $lnk -Force }
     foreach ($pat in @('*sync-agent.ps1*', '*sync-loop.ps1*')) {
@@ -573,7 +1095,7 @@ function Normalize-Config([object]$Config) {
 function Apply-Config {
     param(
         [object[]]$Selected, [string]$Dest, [int]$IntervalMin,
-        [object]$Rclone, [bool]$FirstRun, [scriptblock]$Status, [string]$ResyncMode = 'path1'
+        [object]$Rclone, [bool]$FirstRun, [scriptblock]$Status
     )
     $say = { param($m) if ($Status) { & $Status $m } }
     if (-not (Test-UnderHome $Dest)) { throw "Working folder is outside the user folder: $Dest" }
@@ -586,39 +1108,47 @@ function Apply-Config {
 
     $pairs = Build-Pairs -Selected $Selected -Dest $Dest
     foreach ($p in $pairs) {
-        if (-not (Test-Path $p.Local)) { New-Item -ItemType Directory -Path $p.Local -Force | Out-Null }
+        if (-not (Test-Path -LiteralPath $p.Local)) { New-Item -ItemType Directory -Path $p.Local -Force | Out-Null }
         Set-Marker $p.Local    # marqueur --check-access côté local
         Set-Marker $p.Drive    # et côté Drive (sa présence prouve que le dossier est monté)
         Write-Log "Pair: $($p.Drive)  <->  $($p.Local)"
     }
 
     & $say 'Generating configuration...'
-    New-FiltersFile (Join-Path $meta 'filters.txt')
-
-    Save-Config -Dest $Dest -Config ([pscustomobject]@{
-        version   = 2
-        engine    = 'rclone'
-        dest      = $Dest
-        interval  = $IntervalMin
-        sources   = @($pairs | ForEach-Object { @{ Type = $_.Source.Type; Name = $_.Source.Name; Path = $_.Source.Path; LocalName = $_.LocalName } })
-        installed = (Get-Date -Format 's')
-    })
-
-    & $say 'First sync (may take a while for a large folder)...'
-    # Baseline gérée PAR PAIRE par Sync-Pair (un dossier ajouté plus tard a besoin de
-    # SON propre --resync, sinon bisync sort en erreur).
-    $worst = 0
-    foreach ($p in $pairs) {
-        $code = Sync-Pair -Rclone $Rclone -DrivePath $p.Drive -LocalPath $p.Local -MetaDir $meta -LocalName $p.LocalName -ForceResync $FirstRun -ResyncMode $ResyncMode
-        if ($code -gt $worst) { $worst = $code }
-    }
-
-    & $say 'Installation de la synchronisation automatique...'
+    # Agent stoppé AVANT le swap des filtres et la première synchro : un bisync en vol (lancé
+    # avec l'ancien filters.txt) recréerait sa baseline derrière Reset-PairBaselines et son
+    # --resync réécrirait le .md5 global, contournant le garde « filters file has changed ».
+    # try/finally : l'agent est TOUJOURS réinstallé, même si une étape lève (sinon la machine
+    # resterait sans synchro de fond ni watchdog jusqu'à réouverture manuelle).
     Remove-LegacyArtifacts
     Remove-SyncAgent
-    $hasAgent = Set-SyncAgent -RcloneExe $Rclone.Exe -MetaDir $meta -IntervalMin $IntervalMin
+    $codes = @()
+    $hasAgent = $false
+    try {
+        if (New-FiltersFile (Join-Path $meta 'filters.txt')) { Reset-PairBaselines $meta }
 
-    return [pscustomobject]@{ ExitCode = $worst; Agent = $hasAgent }
+        Save-Config -Dest $Dest -Config ([pscustomobject]@{
+            version   = 2
+            engine    = 'rclone'
+            dest      = $Dest
+            interval  = $IntervalMin
+            sources   = @($pairs | ForEach-Object { @{ Type = $_.Source.Type; Name = $_.Source.Name; Path = $_.Source.Path; LocalName = $_.LocalName } })
+            installed = (Get-Date -Format 's')
+        })
+
+        & $say 'First sync (may take a while for a large folder)...'
+        # Baseline gérée PAR PAIRE par Sync-Pair (un dossier ajouté plus tard a besoin de
+        # SON propre --resync, sinon bisync sort en erreur).
+        foreach ($p in $pairs) {
+            $codes += Sync-Pair -Rclone $Rclone -DrivePath $p.Drive -LocalPath $p.Local -MetaDir $meta -LocalName $p.LocalName -ForceResync $FirstRun -Manual $false
+        }
+    } finally {
+        & $say 'Installation de la synchronisation automatique...'
+        $hasAgent = Set-SyncAgent -RcloneExe $Rclone.Exe -MetaDir $meta -IntervalMin $IntervalMin
+    }
+
+    # Sévérité (pas max numérique) : « Drive absent » (90) ne masque pas un abort réel 1/7.
+    return [pscustomobject]@{ ExitCode = (Merge-SyncCodes $codes); Agent = $hasAgent }
 }
 
 # Désynchroniser un dossier : remonte son contenu vers Drive (copie seule, sans
@@ -634,41 +1164,69 @@ function Remove-TrackedFolder {
     $script:LogFile = Join-Path $meta 'bridge.log'
     $local = Join-Path $Config.dest (Resolve-LocalName $Source)
 
-    if (Test-Path $local) {
-        Assert-SafePath $local; Assert-SafePath $Source.Path
-        # remontée copie-seule local -> Drive (jamais de suppression côté Drive)
-        $log = Join-Path $meta 'rclone.log'
-        $filters = Join-Path $meta 'filters.txt'
-        New-FiltersFile $filters   # toujours régénéré : un filters.txt d'un ancien build (sans exclusions FFS) ferait re-échouer la remontée
-        Assert-SafePath $filters
-        $argLine = @('copy', ('"{0}"' -f $local), ('"{0}"' -f $Source.Path),
-            '--filters-file', ('"{0}"' -f $filters),
-            '--checkers', '4', '--transfers', '4',
-            '--log-file', ('"{0}"' -f $log), '--log-level', 'INFO') -join ' '
-        $pushed = $false
-        try {
-            $p = Start-Process -FilePath $Rclone.Exe -ArgumentList $argLine -WindowStyle Hidden -PassThru -Wait
-            $pushed = ([int]$p.ExitCode -eq 0)
-            Write-Log "Unsync: copy local->Drive of '$($Source.Name)', code $($p.ExitCode)"
-        } catch { Write-Log "Unsync: upload failed: $($_.Exception.Message)" 'WARN' }
-        if (-not $pushed) {
-            Show-Warn("The upload to Google Drive did not complete. For safety, the local copy is NOT deleted (no data lost).")
-            return $false
-        }
-        try { Remove-ToRecycleBin $local } catch { Write-Log "Unsync: recycle bin failed: $local ($($_.Exception.Message))" 'WARN' }
-    }
-
+    # Valider les chemins AVANT de couper l'agent : un throw d'Assert-SafePath ici ne laisse
+    # pas la machine sans agent (l'agent n'est stoppé qu'ensuite).
+    Assert-SafePath $Source.Path
+    if (Test-Path -LiteralPath $local) { Assert-SafePath $local }
     $remaining = @(Get-SortedSources $Config | Where-Object { $_.Path -ne $Source.Path })
-    if ($remaining.Count -eq 0) {
-        Remove-SyncAgent; Remove-LegacyArtifacts
-        Save-Config -Dest $Config.dest -Config ([pscustomobject]@{
-            version = 2; engine = 'rclone'; dest = $Config.dest; interval = [int]$Config.interval
-            sources = @(); installed = (Get-Date -Format 's')
-        })
+    $agentHandled = $false
+
+    # Agent stoppé pendant la désync (copie + recyclage) : sinon un tick scannerait un local à
+    # moitié vidé et propagerait des suppressions. finally garantit qu'il repart toujours.
+    Remove-SyncAgent
+    try {
+        if (Test-Path -LiteralPath $local) {
+            $log = Join-Path $meta 'rclone.log'
+            # Filtre de désync = volatile seulement : les dossiers dev (.git, node_modules...) qui
+            # n'existaient que localement REPARTENT sur Drive (sinon ils finiraient à la corbeille).
+            $filters = New-DesyncFilterFile $meta
+            Assert-SafePath $filters
+            # --filter-from (flag global rclone) et PAS --filters-file (propre à bisync). PAS de
+            # --local-no-check-updated : sur ce chemin copie-puis-recyclage on VEUT l'abort si un
+            # fichier est en cours d'écriture (sinon on pousserait un tronqué puis on supprime le bon).
+            $argLine = @('copy', ('"{0}"' -f $local), ('"{0}"' -f $Source.Path),
+                '--filter-from', ('"{0}"' -f $filters),
+                '--checkers', '1', '--transfers', '4', '--local-no-preallocate',
+                '--log-file', ('"{0}"' -f $log)) + $script:BisyncLogFlags
+            $argLine = $argLine -join ' '
+            $pushed = $false
+            try {
+                $p = Start-Process -FilePath $Rclone.Exe -ArgumentList $argLine -WindowStyle Hidden -PassThru -Wait
+                $pushed = ([int]$p.ExitCode -eq 0)
+                Write-Log "Unsync: copy local->Drive of '$($Source.Name)', code $($p.ExitCode)"
+            } catch { Write-Log "Unsync: upload failed: $($_.Exception.Message)" 'WARN' }
+            if (-not $pushed) {
+                Show-Warn("The upload to Google Drive did not complete. For safety, the local copy is NOT deleted (no data lost).")
+                return $false   # le finally relance l'agent
+            }
+            try { Remove-ToRecycleBin $local } catch { Write-Log "Unsync: recycle bin failed: $local ($($_.Exception.Message))" 'WARN' }
+        }
+
+        # État de la paire retirée : baseline, jetons de récupération, statut (-LiteralPath : [ ] possibles)
+        $ln = Resolve-LocalName $Source
+        foreach ($f in @((Join-Path (Join-Path $meta 'bisync-state') ($ln + '.synced')),
+                         (Join-Path (Join-Path $meta 'bisync-state') ($ln + '.resync-pending')),
+                         (Join-Path (Join-Path $meta 'bisync-state') ($ln + '.force-pending')),
+                         (Join-Path (Join-Path $meta 'status') ($ln + '.json')))) {
+            if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+        }
+
+        if ($remaining.Count -eq 0) {
+            Remove-LegacyArtifacts   # 0 dossier restant : aucun agent voulu
+            Save-Config -Dest $Config.dest -Config ([pscustomobject]@{
+                version = 2; engine = 'rclone'; dest = $Config.dest; interval = [int]$Config.interval
+                sources = @(); installed = (Get-Date -Format 's')
+            })
+            $agentHandled = $true
+            return $true
+        }
+        $agentHandled = $true   # Apply-Config (ci-dessous) réinstalle l'agent dans son propre finally,
+        Apply-Config -Selected $remaining -Dest $Config.dest -IntervalMin ([int]$Config.interval) -Rclone $Rclone -FirstRun $false -Status $null | Out-Null
         return $true
+    } finally {
+        # Sortie anticipée (échec remontée) ou exception : ne jamais laisser la machine sans agent.
+        if (-not $agentHandled) { Set-SyncAgent -RcloneExe $Rclone.Exe -MetaDir $meta -IntervalMin ([int]$Config.interval) | Out-Null }
     }
-    Apply-Config -Selected $remaining -Dest $Config.dest -IntervalMin ([int]$Config.interval) -Rclone $Rclone -FirstRun $false -Status $null | Out-Null
-    return $true
 }
 
 # ----------------------------------------------------------------------------
@@ -762,7 +1320,7 @@ function Invoke-LegacyMigration {
     Remove-FfsArtifacts -Dest $dest -Sources $sources
 
     if ($sources.Count -eq 0) {
-        New-FiltersFile (Join-Path $meta 'filters.txt')
+        $null = New-FiltersFile (Join-Path $meta 'filters.txt')
         Save-Config -Dest $dest -Config ([pscustomobject]@{
             version = 2; engine = 'rclone'; dest = $dest; interval = [int]$Config.interval
             sources = @(); installed = (Get-Date -Format 's')
@@ -773,9 +1331,9 @@ function Invoke-LegacyMigration {
 
     & $say 'Switching to the new engine (may take a moment)...'
     # Apply-Config réécrit config.json en v2, pose markers + filtres (FFS exclus), baseline
-    # --resync (local et Drive déjà alignés par FFS -> union quasi nulle), installe l'agent.
-    # ResyncMode 'newer' : préserve une édition locale plus récente (FFS a déjà aligné les deux côtés).
-    $res = Apply-Config -Selected $sources -Dest $dest -IntervalMin ([int]$Config.interval) -Rclone $Rclone -FirstRun $true -ResyncMode 'newer' -Status $Status
+    # --resync 'newer' (local et Drive déjà alignés par FFS -> union quasi nulle, et une
+    # édition locale plus récente que FFS n'avait pas poussée est préservée), installe l'agent.
+    $res = Apply-Config -Selected $sources -Dest $dest -IntervalMin ([int]$Config.interval) -Rclone $Rclone -FirstRun $true -Status $Status
     Write-Log "Migration complete: $($sources.Count) folder(s) switched to rclone (first-sync code $($res.ExitCode))."
     if ([int]$res.ExitCode -ne 0) { Write-Log "Migration: first sync code $($res.ExitCode); the resident agent will retry resync until a baseline is set." 'WARN' }
     return $true
@@ -1038,6 +1596,8 @@ function Show-ManageDialog {
     $form.Controls.Add($btnClose)
 
     $nextFile = Join-Path (Get-MetaDir $Config.dest) 'next-sync'
+    $script:mgTick = 0
+    $script:mgHealth = $null
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 1000
     $timer.Add_Tick({
@@ -1050,7 +1610,25 @@ function Show-ManageDialog {
                 else { $txt = 'Next sync in {0:mm\:ss}' -f $rem }
             }
         } catch {}
-        $lblTimer.Text = $txt
+        # Santé réelle (status\<paire>.json écrits par l'agent). Recalcul ~1x/5 s seulement (les
+        # valeurs changent en minutes) : sinon N parses JSON par seconde sur le thread UI. Le compte
+        # à rebours, lui, reste à 1 s. Intervalle passé depuis mgConfig (pas de relecture disque).
+        if (($script:mgTick % 5) -eq 0) {
+            try { $script:mgHealth = Get-BridgeHealth -MetaDir (Get-MetaDir $script:mgConfig.dest) -Sources $script:mgSources -IntervalMin ([int]$script:mgConfig.interval) } catch {}
+        }
+        $script:mgTick++
+        $health = $script:mgHealth
+        # Grâce au démarrage (~15 s) : au boot, l'agent vient d'être relancé et n'a pas encore
+        # écrit de statut -> ne pas alarmer avec « agent may be stopped » (verdict périmé, s'auto-corrige).
+        if ($health -and $health.ContainsKey('Kind') -and $health.Kind -eq 'stale' -and $script:mgTick -le 15) { $health = $null }
+        if ($health) {
+            $lblTimer.Text = $txt + '   -   ' + $health.Text
+            if ($health.Ok) { $lblTimer.ForeColor = [System.Drawing.Color]::DimGray }
+            else            { $lblTimer.ForeColor = [System.Drawing.Color]::Firebrick }
+        } else {
+            $lblTimer.Text = $txt
+            $lblTimer.ForeColor = [System.Drawing.Color]::DimGray
+        }
     })
     $timer.Start()
     $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose() })
@@ -1100,14 +1678,15 @@ function Show-ManageDialog {
     $btnSync.Add_Click({
         $busy.Invoke('Syncing...')
         try {
-            $worst = 0
+            $codes = @()
             foreach ($s in $script:mgSources) {
                 $local = Join-Path $script:mgConfig.dest (Resolve-LocalName $s)
-                if (-not (Test-Path $local)) { continue }
-                $code = Sync-Pair -Rclone $Rclone -DrivePath $s.Path -LocalPath $local -MetaDir (Get-MetaDir $script:mgConfig.dest) -LocalName (Resolve-LocalName $s) -ForceResync $false
-                if ($code -gt $worst) { $worst = $code }
+                if (-not (Test-Path -LiteralPath $local)) { continue }
+                # -Manual : le clic humain débloque une paire coincée (escalade resync/force inline,
+                # sans attendre les gates 24 h/consécutif). Sévérité : 90 ne masque pas un abort réel.
+                $codes += Sync-Pair -Rclone $Rclone -DrivePath $s.Path -LocalPath $local -MetaDir (Get-MetaDir $script:mgConfig.dest) -LocalName (Resolve-LocalName $s) -ForceResync $false -Manual $true
             }
-            $busy.Invoke((Get-SyncResultText $worst))
+            $busy.Invoke((Get-SyncResultText (Merge-SyncCodes $codes)))
         } catch { $busy.Invoke("Sync could not start: $($_.Exception.Message)") }
     })
     $btnOpen.Add_Click({ Start-Process explorer.exe -ArgumentList ('"{0}"' -f $script:mgConfig.dest) })
@@ -1180,14 +1759,31 @@ function Start-Bridge {
         # Rafraîchit la config de synchro au lancement : un upgrade binaire ne relance pas Apply-Config,
         # donc filters.txt ET l'agent résident garderaient l'ancien jeu (anciennes exclusions, pas de
         # throttle --checkers). On régénère les deux ici pour qu'un client mis à jour en bénéficie.
-        try {
-            if (Test-UnderHome $existing.dest) {
-                $rm = Get-MetaDir $existing.dest
-                New-FiltersFile (Join-Path $rm 'filters.txt')
-                Remove-SyncAgent
+        # Filtres modifiés -> baselines invalidées : bisync hash le filters-file et abort
+        # « filters file has changed (must run --resync) » sinon ; le resync 'newer' repart proprement.
+        # Agent stoppé AVANT le swap (un bisync en vol recréerait sa baseline derrière le reset).
+        # try/finally : l'agent est TOUJOURS réinstallé, même si le swap/re-pose de marqueurs lève
+        # (sinon on aurait tué l'agent sans le relancer -> plus de synchro de fond jusqu'à réouverture).
+        if (Test-UnderHome $existing.dest) {
+            $rm = Get-MetaDir $existing.dest
+            Remove-SyncAgent
+            try {
+                if (New-FiltersFile (Join-Path $rm 'filters.txt')) { Reset-PairBaselines $rm }
+                # Re-pose les marqueurs --check-access (un client peut avoir supprimé ce fichier
+                # « inconnu » via Drive web -> échec permanent sinon). Côté Drive : seulement si le
+                # dossier a du contenu — un dossier vu vide peut être une projection défaillante,
+                # y re-poser le marqueur désarmerait le garde anti-suppression massive.
+                foreach ($s in @(Get-SortedSources $existing)) {
+                    Set-Marker (Join-Path $existing.dest (Resolve-LocalName $s))
+                    try {
+                        if ((Test-Path -LiteralPath $s.Path) -and
+                            @(Get-ChildItem -LiteralPath $s.Path -Force -ErrorAction SilentlyContinue | Select-Object -First 1).Count -gt 0) { Set-Marker $s.Path }
+                    } catch {}
+                }
+            } catch {} finally {
                 Set-SyncAgent -RcloneExe $rclone.Exe -MetaDir $rm -IntervalMin ([int]$existing.interval) | Out-Null
             }
-        } catch {}
+        }
         Show-ManageDialog -Config $existing -Rclone $rclone
         return
     }
