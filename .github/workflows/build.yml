@@ -17,6 +17,65 @@ permissions:
   contents: write   # création de la Release
 
 jobs:
+  # Garde-fou de syntaxe : le développement se fait sur macOS, la cible est Windows
+  # PowerShell 5.1. Ce job est le SEUL endroit où le script est réellement analysé par
+  # l'interpréteur cible — et le seul où l'agent résident, qui vit dans un here-string et
+  # n'est donc jamais relu par personne, est extrait puis analysé lui aussi.
+  # Volontairement SANS `needs` côté release : un défaut de ce garde-fou ne doit pas
+  # empêcher la publication d'un correctif. À rendre bloquant après le banc Windows.
+  lint:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Syntaxe de l'installeur (Windows PowerShell 5.1)
+        shell: powershell   # 'powershell' = PS 5.1 sur windows-latest ('pwsh' serait PS 7)
+        run: |
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\Install-CoworkBridge.ps1", [ref]$null, [ref]$errs)
+          if ($errs -and $errs.Count -gt 0) {
+            $errs | ForEach-Object { Write-Host ("L{0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) }
+            throw "Erreurs de syntaxe dans Install-CoworkBridge.ps1"
+          }
+          Write-Host "Install-CoworkBridge.ps1 : syntaxe OK"
+
+      - name: Encodage UTF-8 avec BOM
+        shell: powershell
+        run: |
+          # Sans BOM, PS 5.1 lit le fichier en ANSI : tous les accents de l'UI cassent.
+          $b = [System.IO.File]::ReadAllBytes("$PWD\Install-CoworkBridge.ps1")
+          if ($b.Length -lt 3 -or $b[0] -ne 0xEF -or $b[1] -ne 0xBB -or $b[2] -ne 0xBF) {
+            throw "Install-CoworkBridge.ps1 n'est plus en UTF-8 AVEC BOM"
+          }
+          Write-Host "BOM UTF-8 present"
+
+      - name: Syntaxe de l'agent resident genere
+        shell: powershell
+        run: |
+          # L'agent est produit par interpolation d'un here-string : ce qui tourne chez le
+          # client n'existe nulle part en tant que fichier. On reproduit l'interpolation
+          # (littéraux injectés à la génération, puis backtick-$ -> $) et on analyse le résultat.
+          $src = [System.IO.File]::ReadAllText("$PWD\Install-CoworkBridge.ps1")
+          $m = [regex]::Match($src, '(?s)\$agent = @"\r?\n(.*?)\r?\n"@')
+          if (-not $m.Success) { throw "Here-string de l'agent introuvable (le motif a change ?)" }
+          $body = $m.Groups[1].Value
+          $subs = @{
+            'safetyLit' = "'--max-delete', '100'"; 'perfLit' = "'--checkers', '1'"
+            'logLit'    = "'--log-level', 'INFO'"; 'rcLit'   = 'C:\app\rclone.exe'
+            'metaLit'   = 'C:\work\_bridge';       'markLit' = '.coworkbridge-ok'
+            'codeMissingLit' = '90'; 'gateHoursLit' = '24'; 'consecLit' = '2'; 'throttleLit' = '3'
+          }
+          foreach ($k in $subs.Keys) { $body = $body -replace ('\$' + $k), $subs[$k] }
+          $body = $body -replace '`\$', '$'
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseInput($body, [ref]$null, [ref]$errs)
+          if ($errs -and $errs.Count -gt 0) {
+            $errs | ForEach-Object { Write-Host ("agent L{0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) }
+            throw "Erreurs de syntaxe dans l'agent resident genere"
+          }
+          Write-Host "sync-agent.ps1 (genere) : syntaxe OK"
+
   release:
     runs-on: windows-latest
     steps:
