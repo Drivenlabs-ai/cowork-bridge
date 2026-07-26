@@ -21,7 +21,7 @@
         d'effacement Drive), la version la plus récente gagne — au 1er run le local
         est vide, donc Drive fait foi de fait.
       - Sûreté : --check-access (marqueur .coworkbridge-ok des deux côtés),
-        --max-delete 25, --conflict-resolve none (garde les 2 versions),
+        --conflict-resolve none (garde les 2 versions),
         --backup-dir local daté (équivalent corbeille) + corbeille Drive native,
         --resilient --recover --max-lock 2m, rotation du journal rclone.log.
       - Observabilité : statut par paire dans _bridge\status\<nom>.json (agent +
@@ -55,7 +55,13 @@ $script:Repo        = 'Drivenlabs-ai/cowork-bridge'
 # Drapeaux bisync statiques (sûreté + perf + log) : SOURCE UNIQUE, partagée mot pour
 # mot entre Get-BisyncArgLine (installeur) et l'agent résident (sérialisée dans sync-agent.ps1
 # à la génération). Tokens littéraux uniquement, aucune valeur par-run. Modifier ici = les deux suivent.
-$script:BisyncSafetyFlags   = @('--max-delete', '25', '--conflict-resolve', 'none')
+# --max-delete est un POURCENTAGE en bisync (source v1.74.3, deltas.go/excessDeletes :
+# curRatio = deleted / oldCount, abort si curRatio > maxRatio). À 100, le ratio ne peut pas le
+# dépasser : le garde ne bloque plus jamais un run. Décision Alex 2026-07-26 — le dossier local
+# reflète le Drive, suppressions comprises ; un seuil bas gelait un geste métier ordinaire (retirer
+# un dossier client pèse plus que 25 % d'une paire). Garde-fous conservés : --check-access +
+# marqueur (abort si un côté est vu vide ou non monté), corbeille Drive 30 j, --backup-dir2 local.
+$script:BisyncSafetyFlags   = @('--max-delete', '100', '--conflict-resolve', 'none')
 # --local-no-preallocate : la préallocation Windows de rclone arrondit la taille au secteur ; la
 # projection Google Drive Desktop rapporte alors la taille préallouée (octets NULL en fin) -> abort
 # « corrupted on transfer: sizes differ » (rclone #3207, flag officiel v1.55). --local-no-check-updated :
@@ -409,8 +415,9 @@ function Get-BisyncArgLine {
     # Premier run d'une paire : le local vient d'être créé (vide) -> équivalent « Drive fait foi » ;
     # récupération (filtres changés, abort critique) : préserve l'édition locale la plus récente.
     if ($Resync) { $parts += @('--resync', '--resync-mode', 'newer') }
-    # --force = assumer un run dont les suppressions dépassent --max-delete (réorganisation
-    # Cowork réelle, confirmée par 2 signaux consécutifs). No-op s'il n'y a pas d'excès.
+    # --force = assumer un run dont les suppressions dépassent --max-delete. INERTE depuis que le
+    # seuil est à 100 (l'abort ne peut plus se produire) : conservé pour le jour où un seuil serait
+    # rétabli. No-op s'il n'y a pas d'excès.
     elseif ($Force) { $parts += '--force' }
     return ($parts -join ' ')
 }
@@ -464,7 +471,8 @@ function Write-SyncStatus([string]$MetaDir, [string]$LocalName, [int]$Code, [boo
         $lastAuto = Get-StatusField $old 'lastAutoResync' $null
         if ($lastAuto -is [datetime]) { $lastAuto = $lastAuto.ToString('o') }
         if ($MarkAutoResync) { $lastAuto = $now }
-        # deleteAborts = signaux « too many deletes » consécutifs (remis à 0 dès qu'un run n'en émet pas)
+        # deleteAborts = signaux « too many deletes » consécutifs (remis à 0 dès qu'un run n'en émet
+        # pas). Reste à 0 en pratique depuis --max-delete 100 : plus aucun run n'émet ce signal.
         $deleteAborts = 0
         if ($DeleteSignal) { $deleteAborts = 1 + [int](Get-StatusField $old 'deleteAborts' 0) }
         $lastForce = Get-StatusField $old 'lastAutoForce' $null
@@ -498,11 +506,14 @@ function Get-LogOffset([string]$MetaDir) {
     return [long]0
 }
 
+# INERTE depuis --max-delete 100 : l'abort ne peut plus se produire, rclone n'émet donc plus jamais
+# ce motif. Conservé tel quel pour le jour où un seuil serait rétabli — ne pas s'appuyer dessus.
 # Détecte l'abort « too many deletes » (garde --max-delete) du run qui vient de s'achever : il sort
-# en exit 1 (jamais 7, vérifié source rclone) -> indétectable par le code seul. On ne scanne QUE les
-# octets ajoutés par CE run (de $FromOffset à la fin), donc strictement par paire (log partagé) et
-# insensible à la rotation (si le fichier a rétréci, on repart de 0). Le motif texte reste fragile
-# (dépend du libellé rclone) -> à confirmer sur Windows. Faux positif bénin : --force sans excès = no-op.
+# en exit 1 et non 7 (vérifié source v1.74.3 : excessDeletes met b.abort, pas b.critical, et les
+# listings sont préservés) -> indétectable par le code seul. On ne scanne QUE les octets ajoutés par
+# CE run (de $FromOffset à la fin), donc strictement par paire (log partagé) et insensible à la
+# rotation (si le fichier a rétréci, on repart de 0). Motif confirmé sur la source : le message émis
+# est « Safety abort: too many deletes (>N%, x of y) ... ». Faux positif bénin : --force sans excès = no-op.
 function Test-MaxDeleteSignal([string]$MetaDir, [long]$FromOffset) {
     try {
         $log = Join-Path $MetaDir 'rclone.log'
@@ -592,11 +603,15 @@ function Get-BridgeHealth([string]$MetaDir, [object[]]$Sources, [int]$IntervalMi
 
 # Synchronise une paire en gérant sa baseline : --resync si la paire n'a jamais été
 # synchronisée (marqueur absent) ou si un jeton de récupération est posé, sinon bisync
-# normal. Marqueur posé après un run à 0. Une paire neuve SANS --resync sort en erreur.
+# normal. Marqueur posé après un run à 0 OU 1 (exit 1 = échec non critique, bisync a sauvegardé
+# ses listings : la paire A sa baseline — le réserver à l'exit 0 enfermait une paire à erreur
+# fichier récurrente en --resync perpétuel, donc en union, donc sans jamais propager une
+# suppression). Une paire neuve SANS --resync sort en erreur.
 # Récupération : exit 7 = abort critique bisync (« Must run --resync to recover ») -> jeton
 # one-shot .resync-pending, au plus 1 fois par 24 h (pas de tempête de resyncs). Le jeton est
 # consommé que le resync réussisse ou non. Exit 1 + signal « too many deletes » -> jeton
-# one-shot .force-pending (mêmes gardes). Même logique dans l'agent (Run-All).
+# one-shot .force-pending (mêmes gardes) : chemin INERTE depuis --max-delete 100, conservé au cas
+# où un seuil serait rétabli. Même logique dans l'agent (Run-All).
 function Sync-Pair {
     param([object]$Rclone, [string]$DrivePath, [string]$LocalPath, [string]$MetaDir, [string]$LocalName, [bool]$ForceResync, [bool]$Manual)
     $stateDir = Join-Path $MetaDir 'bisync-state'
@@ -624,8 +639,12 @@ function Sync-Pair {
         } elseif ($code -eq 1 -and (Test-MaxDeleteSignal -MetaDir $MetaDir -FromOffset $offset)) {
             $code = Invoke-Bisync -RcloneExe $Rclone.Exe -DrivePath $DrivePath -LocalPath $LocalPath -MetaDir $MetaDir -LocalName $LocalName -Resync $false -Force $true
         }
+        # Baseline acquise dès qu'un run n'a pas aborté de façon CRITIQUE. Exit 1 = échec non
+        # critique : bisync a sauvegardé ses listings (source v1.74.3, seul b.critical renomme en
+        # .lst-err). Repasser --resync au run suivant serait une union inutile — et une union
+        # ressuscite toute suppression pas encore propagée.
+        if ($code -eq 0 -or $code -eq 1) { New-Item -ItemType File -Path $pairState -Force | Out-Null }
         if ($code -eq 0) {
-            New-Item -ItemType File -Path $pairState -Force | Out-Null
             # État résolu : d'éventuels jetons armés par l'agent sont moot -> évite un double run.
             Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $forceTok -Force -ErrorAction SilentlyContinue
@@ -644,9 +663,11 @@ function Sync-Pair {
     # Jeton force conservé si un resync a pris le pas (il n'a PAS été appliqué) -> il servira au run suivant.
     if ($useForce)   { Remove-Item -LiteralPath $forceTok -Force -ErrorAction SilentlyContinue }
     $mark = $false; $markForce = $false; $delSig = $false
-    if ($code -eq 0) {
-        New-Item -ItemType File -Path $pairState -Force | Out-Null
-    } elseif ($code -eq 7 -and -not $hadPending -and (Test-Path -LiteralPath $pairState)) {
+    # Baseline acquise sur 0 comme sur 1 (exit 1 = non critique, listings sauvegardés) : sans ça,
+    # une erreur fichier récurrente laissait la paire en --resync perpétuel, donc en union, donc
+    # sans jamais propager la moindre suppression — pendant que les ajouts continuaient de passer.
+    if ($code -eq 0 -or $code -eq 1) { New-Item -ItemType File -Path $pairState -Force | Out-Null }
+    if ($code -eq 7 -and -not $hadPending -and (Test-Path -LiteralPath $pairState)) {
         # Armer au Ne exit 7 CONSÉCUTIF seulement : une collision de verrou ponctuelle
         # (Sync now + agent sur la même paire, --max-lock) ne déclenche pas de resync injustifié.
         $prev  = Read-SyncStatus -MetaDir $MetaDir -LocalName $LocalName
@@ -656,6 +677,8 @@ function Sync-Pair {
         if ($last) { try { $ok24 = ((Get-Date) - [datetime]$last).TotalHours -ge $script:RecoveryGateHours } catch {} }
         if ($again -and $ok24) { New-Item -ItemType File -Path $pending -Force | Out-Null; $mark = $true }
     } elseif ($code -eq 1 -and -not $useForce) {
+        # INERTE depuis --max-delete 100 (le signal n'est plus jamais émis) : conservé au cas où un
+        # seuil serait rétabli. Le retirer supposerait de purger aussi les jetons et les champs de statut.
         # « too many deletes » (réorganisation Cowork : déplacement = suppression + création).
         # Armé au Ne signal consécutif (un glitch de projection fluctue, une réorganisation
         # persiste) ; suppressions récupérables : corbeille Drive + backup-dir2 local. 1x/fenêtre.
@@ -814,6 +837,8 @@ function Get-LogOffset {
     return [long]0
 }
 
+# INERTE depuis --max-delete 100 : l'abort ne peut plus se produire, le motif n'est plus jamais
+# emis. Conserve au cas ou un seuil serait retabli -- ne pas s'appuyer dessus.
 # Abort « too many deletes » (garde --max-delete) : sort en exit 1 -> indetectable par le code
 # seul. On scanne UNIQUEMENT les octets ajoutes par CE run (de `$fromOffset a la fin) : strictement
 # par paire malgre le log partage, insensible a la rotation (fichier retreci -> depuis 0). Motif
@@ -890,9 +915,11 @@ function Run-All {
         if (`$hadPending -and `$code -ne -1) { Remove-Item -LiteralPath `$pending -Force -ErrorAction SilentlyContinue }
         if (`$useForce -and `$code -ne -1)   { Remove-Item -LiteralPath `$forceTok -Force -ErrorAction SilentlyContinue }
         `$markResync = `$false; `$markForce = `$false; `$delSig = `$false
-        if (`$code -eq 0) {
-            New-Item -ItemType File -Path `$pairState -Force | Out-Null
-        } elseif (`$code -eq 7 -and -not `$hadPending -and (Test-Path -LiteralPath `$pairState)) {
+        # Baseline acquise sur 0 comme sur 1 (exit 1 = non critique, bisync a sauvegarde ses
+        # listings) : sinon une erreur fichier recurrente laisse la paire en --resync perpetuel,
+        # donc en union, donc sans jamais propager une suppression.
+        if (`$code -eq 0 -or `$code -eq 1) { New-Item -ItemType File -Path `$pairState -Force | Out-Null }
+        if (`$code -eq 7 -and -not `$hadPending -and (Test-Path -LiteralPath `$pairState)) {
             # exit 7 = abort critique bisync (Must run --resync to recover) -> resync de recuperation,
             # arme au Ne exit 7 CONSECUTIF (une collision de verrou ponctuelle ne declenche rien),
             # au plus 1 fois par fenetre (pas de tempete de resyncs)
@@ -906,6 +933,8 @@ function Run-All {
                 `$markResync = `$true
             }
         } elseif (`$code -eq 1 -and -not `$useForce) {
+            # INERTE depuis --max-delete 100 (signal plus jamais emis) : conserve au cas ou un
+            # seuil serait retabli.
             # too many deletes (reorganisation Cowork : deplacement = suppression + creation).
             # Arme au Ne signal consecutif (un glitch de projection fluctue, une reorganisation
             # persiste) ; suppressions recuperables (corbeille Drive + backup-dir2). 1x/fenetre.
@@ -1335,7 +1364,9 @@ function Invoke-LegacyMigration {
     # édition locale plus récente que FFS n'avait pas poussée est préservée), installe l'agent.
     $res = Apply-Config -Selected $sources -Dest $dest -IntervalMin ([int]$Config.interval) -Rclone $Rclone -FirstRun $true -Status $Status
     Write-Log "Migration complete: $($sources.Count) folder(s) switched to rclone (first-sync code $($res.ExitCode))."
-    if ([int]$res.ExitCode -ne 0) { Write-Log "Migration: first sync code $($res.ExitCode); the resident agent will retry resync until a baseline is set." 'WARN' }
+    # Exit 1 = la baseline EST posée (listings bisync sauvegardés) : l'agent reprend en run normal.
+    # Les autres codes non nuls (2, 7...) laissent la paire sans baseline -> resync au passage suivant.
+    if ([int]$res.ExitCode -ne 0) { Write-Log "Migration: first sync code $($res.ExitCode); baseline set on exit 1, otherwise the resident agent retries a resync." 'WARN' }
     return $true
 }
 
