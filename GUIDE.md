@@ -36,9 +36,19 @@ Rien à faire, la synchronisation tourne en arrière-plan :
 
 - **Tes modifications dans Cowork** → renvoyées vers Google Drive **quasi instantanément** (un agent de synchronisation tourne en fond et réagit à chaque modification).
 - **Les changements venant de Drive** (toi sur un autre appareil, un collègue sur un Drive partagé) → récupérés dans ton dossier de travail **toutes les 30 min** par défaut (réglable).
-- Les suppressions passent par la **corbeille** (Windows + corbeille Drive), jamais en dur → toujours récupérables.
+- Les suppressions passent par la **corbeille** (corbeille Google côté Drive, sauvegarde datée côté PC), jamais en dur → toujours récupérables.
 
-**Sûreté des données** : la toute première copie ne fait que **descendre** tes fichiers de Drive vers le PC — elle ne peut rien supprimer côté Drive. La synchronisation ne devient bidirectionnelle qu'ensuite. Et si tu retires un dossier, sa copie locale n'est libérée qu'**après avoir été renvoyée vers Drive avec succès**, et part à la corbeille.
+### La règle à retenir : Google Drive fait référence
+
+Le dossier de travail sur ton PC est une **copie de travail**. Google Drive reste la version qui fait foi. En pratique :
+
+- **Pour ranger, déplacer ou supprimer, fais-le sur Google Drive.** Le changement descend ensuite sur tous les postes, toujours, même si un collègue avait le fichier ouvert ou modifié de son côté.
+- **Ce que Cowork écrit dans le dossier de travail remonte tout seul** sur Drive : nouveaux fichiers, modifications, et aussi suppressions et renommages.
+- **Si le même fichier a changé des deux côtés** entre deux synchros, c'est la version de Drive qui est gardée. Ta version locale n'est pas perdue : elle est déposée dans `_bridge\trash\<date>\` à l'intérieur de ton dossier de travail.
+
+**Sûreté des données.** Rien n'est jamais supprimé en dur. Côté PC, tout ce qui est remplacé ou retiré part dans la sauvegarde datée `_bridge\trash\`. Côté Drive, la corbeille Google garde tout 30 jours. La toute première copie ne fait que **descendre** les fichiers de Drive vers le PC. Et si tu retires un dossier, sa copie locale n'est libérée qu'**après avoir été renvoyée vers Drive avec succès**.
+
+Un garde-fou : si beaucoup de fichiers disparaissent d'un coup de ton dossier de travail (disque abîmé, mauvaise manipulation), **rien n'est supprimé sur Drive**. Le dossier est rétabli depuis Drive et la fenêtre te le signale. Si la suppression était voulue, refais-la sur Drive.
 
 Pour forcer une synchronisation immédiate : ouvre **Cowork Bridge** (icône du bureau, ou menu Démarrer → **Configurer Cowork Bridge**) → **Synchroniser maintenant**.
 
@@ -71,7 +81,9 @@ Cowork Bridge **réduit** ton espace utilisé si tu étais en mode « Dupliquer 
 | Cowork affiche un dossier vide | Tu as connecté le dossier Google Drive au lieu du **dossier de travail** (`CoworkWork`). Connecte `CoworkWork`. |
 | **Session « vierge » au redémarrage / disque C: plein** | Le disque a été saturé → Windows ouvre un profil temporaire. **Ne rien enregistrer dans cette session** (tout y est effacé à la déconnexion ; tes vrais fichiers sont intacts). Libère de l'espace en **supprimant `C:\Users\<toi>\CoworkWork`** (ce sont des copies, tout est dans Drive), puis **redémarre**. (L'outil empêche normalement ça en refusant un dossier trop gros.) |
 | Pas de mise à jour automatique des fichiers | Rouvre Cowork Bridge → regarde le **minuteur**, ou clique **« Synchroniser maintenant »**. Si besoin, désynchronise puis ré-ajoute le dossier. |
-| Un conflit de fichier (modifié des deux côtés) | Les **deux versions sont conservées** (l'une renommée en `...conflict1`), rien n'est perdu. Bouton **« Ouvrir le dossier local »** → `_bridge\rclone.log` pour le détail. |
+| Un fichier modifié des deux côtés | La version de Google Drive est gardée. La tienne n'est pas perdue : elle est dans `_bridge\trash\<date>\` à l'intérieur de ton dossier de travail. |
+| J'ai supprimé des fichiers en local, ils sont revenus | Deux cas. Soit un collègue les avait modifiés sur Drive entre-temps, et Drive fait référence. Soit tu en as retiré beaucoup d'un coup et le garde-fou a préféré ne rien supprimer sur Drive. Dans les deux cas, refais la suppression **sur Google Drive**. |
+| Un fichier renommé apparaît en double | Le renommage a été fait sur un poste pendant que Drive n'était pas joignable. Supprime le doublon **sur Google Drive**. |
 
 Journal et configuration : bouton **« Ouvrir le dossier local »** → sous-dossier `_bridge` (pas besoin de taper un chemin).
 

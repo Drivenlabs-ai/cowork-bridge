@@ -22,6 +22,11 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $root 'Install-CoworkBridge.ps1') -LibraryOnly
 
 if (-not (Test-Path -LiteralPath $RclonePath)) { throw "rclone introuvable : $RclonePath" }
+
+# Le banc mesure la logique de synchronisation, pas la politique de reprise de rclone. Sans
+# cette surcharge, chaque cas qui provoque une erreur attend les 30 s de --retries-sleep et le
+# banc passe de quelques secondes à plusieurs minutes. Les autres drapeaux restent ceux du produit.
+$script:RcloneCommonFlags = @('--checkers', '1', '--transfers', '4', '--local-no-preallocate', '--retries', '1')
 $script:Rc = [pscustomobject]@{ Exe = $RclonePath }
 $script:Failures = 0
 $script:Ran = 0
@@ -31,12 +36,14 @@ $script:Root = Join-Path $env:TEMP ('cwb-tests-' + [guid]::NewGuid().ToString('N
 
 # Un cas = un dossier Drive, un ou plusieurs dossiers de travail, un _bridge par poste.
 function New-Case {
-    param([string]$Name, [int]$Posts = 1)
+    # PowerShell ignore la casse des variables : nommer la liste $posts écraserait le paramètre
+    # $Posts, typé [int], et la conversion échouerait sur tous les cas d'un coup.
+    param([string]$Name, [int]$PostCount = 1)
     $case = Join-Path $script:Root $Name
     New-Item -ItemType Directory -Path (Join-Path $case 'drive') -Force | Out-Null
     Set-Marker (Join-Path $case 'drive')
     $posts = @()
-    for ($i = 1; $i -le $Posts; $i++) {
+    for ($i = 1; $i -le $PostCount; $i++) {
         $dest = Join-Path $case ('poste' + $i)
         $local = Join-Path $dest 'Dossier'
         $meta = Join-Path $dest $script:MetaDirName
@@ -114,6 +121,9 @@ function Test-Case {
     Write-Host ("  " + $Name) -ForegroundColor Cyan
     try { & $Body } catch {
         Write-Host ("    ECHEC exception : " + $_.Exception.Message) -ForegroundColor Red
+        # La pile dit QUELLE ligne a levé : sans elle, une conversion ratée en profondeur
+        # ressemble à n'importe quelle autre et se cherche à l'aveugle.
+        foreach ($l in ($_.ScriptStackTrace -split "`n")) { Write-Host ("           " + $l.Trim()) -ForegroundColor DarkRed }
         $script:Failures++
     }
 }
@@ -122,6 +132,42 @@ function Test-Case {
 
 Write-Host ""
 Write-Host "Banc moteur de synchronisation" -ForegroundColor White
+
+# Chaque brique doit rendre EXACTEMENT une valeur. Une instruction qui écrit dans le pipeline
+# sans être capturée transforme un code de sortie en tableau, et la passe entière échoue sur
+# une conversion. Ce cas isole la brique fautive au lieu de laisser deviner.
+Test-Case 'fumee : chaque brique rend une seule valeur' {
+    $c = New-Case 'fumee'
+    Set-File $c.Drive 'a.md'
+    $filters = Join-Path $c.Posts[0].Meta 'filters.txt'
+    $probes = @(
+        @{ Nom = 'Get-FolderListing'; Bloc = { Get-FolderListing -RcloneExe $script:Rc.Exe -Path $c.Drive -FiltersFile $filters } }
+        @{ Nom = 'Invoke-RcloneRun';  Bloc = { Invoke-RcloneRun -RcloneExe $script:Rc.Exe -ArgLine ('lsf "{0}"' -f $c.Drive) -Label 'sonde' } }
+        @{ Nom = 'New-PassFilterFile'; Bloc = { New-PassFilterFile -MetaDir $c.Posts[0].Meta -LocalName 'Dossier' -BaseFilters $filters -Protect @() } }
+        @{ Nom = 'Write-PairIndex';   Bloc = { Write-PairIndex (Get-PairIndexPath $c.Posts[0].Meta 'sonde' 'local') @{ 'x.md' = '2026-01-01 00:00:00;1' } } }
+        @{ Nom = 'Write-SyncStatus';  Bloc = { Write-SyncStatus -MetaDir $c.Posts[0].Meta -LocalName 'sonde' -Code 0 } }
+        @{ Nom = 'Set-Marker';        Bloc = { Set-Marker $c.Drive } }
+        @{ Nom = 'Get-SyncPlan';      Bloc = { Get-SyncPlan -IndexLocal @{} -IndexDrive @{} -Local @{} -Drive @{} } }
+    )
+    foreach ($p in $probes) {
+        $out = @(& $p.Bloc)
+        $attendu = 1
+        if ($p.Nom -eq 'Write-PairIndex' -or $p.Nom -eq 'Write-SyncStatus' -or $p.Nom -eq 'Set-Marker') { $attendu = 0 }
+        if ($out.Count -ne $attendu) {
+            Write-Host ("    ECHEC " + $p.Nom + " rend " + $out.Count + " valeur(s), attendu " + $attendu) -ForegroundColor Red
+            for ($i = 0; $i -lt $out.Count; $i++) {
+                $v = $out[$i]
+                $tn = 'null'; if ($null -ne $v) { $tn = $v.GetType().FullName }
+                $txt = ''; if ($null -ne $v) { $txt = ($v | Out-String).Trim() }
+                if ($txt.Length -gt 100) { $txt = $txt.Substring(0, 100) }
+                Write-Host ("           [$i] ($tn) $txt") -ForegroundColor Red
+            }
+            $script:Failures++
+        } else {
+            Write-Host ("    ok   " + $p.Nom) -ForegroundColor DarkGray
+        }
+    }
+}
 
 Test-Case 'suppression simple : le Drive supprime, le local suit et ne rejoue pas' {
     $c = New-Case 'suppr-simple'
@@ -154,9 +200,13 @@ Test-Case 'fichier local illisible : la suppression passe quand meme (le blocage
     'a', 'b', 'c' | ForEach-Object { Set-File $c.Drive "$_.md" }
     Assert-Code 'premier passage' 0 (Invoke-Pass $c)
 
-    # Verrou exclusif : ni lecture ni écriture par un tiers, ce que produit un document ouvert
+    # Verrou exclusif : ni lecture ni écriture par un tiers, ce que produit un document ouvert.
+    # Le verrou Windows n'existe pas sur les autres systèmes, où le droit de lecture le remplace :
+    # les deux rendent le fichier incopiable, qui est la seule chose que ce cas vérifie.
+    $bloque = Join-Path $c.Posts[0].Local 'bloque.md'
     Set-File $c.Posts[0].Local 'bloque.md' 'verrouille'
-    $stream = [System.IO.File]::Open((Join-Path $c.Posts[0].Local 'bloque.md'), 'Open', 'ReadWrite', 'None')
+    $stream = [System.IO.File]::Open($bloque, 'Open', 'ReadWrite', 'None')
+    if (-not $script:OnWindows) { & chmod 000 $bloque }
     try {
         Remove-Item -LiteralPath (Join-Path $c.Drive 'b.md') -Force
         Invoke-Pass $c | Out-Null
@@ -166,7 +216,10 @@ Test-Case 'fichier local illisible : la suppression passe quand meme (le blocage
         Invoke-Pass $c | Out-Null
         Assert-Equal 'toujours pas au passage suivant' 'a.md c.md' (Get-Content-Set $c.Drive)
         Assert-Equal 'et le fichier verrouillé est toujours là' 'a.md bloque.md c.md' (Get-Content-Set $c.Posts[0].Local)
-    } finally { $stream.Close() }
+    } finally {
+        $stream.Close()
+        if (-not $script:OnWindows) { & chmod 644 $bloque }
+    }
 
     # Verrou levé : le fichier rejoint le Drive au passage suivant, rien n'a été perdu.
     Assert-Code 'passage après déverrouillage' 0 (Invoke-Pass $c)
