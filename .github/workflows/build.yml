@@ -14,15 +14,15 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # création de la Release
+  contents: read    # élevé à write sur le seul job release
 
 jobs:
   # Garde-fou de syntaxe : le développement se fait sur macOS, la cible est Windows
   # PowerShell 5.1. Ce job est le SEUL endroit où le script est réellement analysé par
   # l'interpréteur cible — et le seul où l'agent résident, qui vit dans un here-string et
   # n'est donc jamais relu par personne, est extrait puis analysé lui aussi.
-  # Volontairement SANS `needs` côté release : un défaut de ce garde-fou ne doit pas
-  # empêcher la publication d'un correctif. À rendre bloquant après le banc Windows.
+  # Bloquant pour la release (`needs`) : une version est partie en juillet sans avoir jamais
+  # tourné sous Windows, et le client a désinstallé l'outil trois semaines plus tard.
   lint:
     runs-on: windows-latest
     steps:
@@ -60,11 +60,15 @@ jobs:
           $m = [regex]::Match($src, '(?s)\$agent = @"\r?\n(.*?)\r?\n"@')
           if (-not $m.Success) { throw "Here-string de l'agent introuvable (le motif a change ?)" }
           $body = $m.Groups[1].Value
+          # Les clés doivent suivre les littéraux sérialisés par Set-SyncAgent : un nom oublié
+          # ici laisse un $xxx dans le corps analysé, qui passe le parseur sans rien prouver.
           $subs = @{
-            'safetyLit' = "'--max-delete', '100'"; 'perfLit' = "'--checkers', '1'"
+            'commonLit' = "'--checkers', '1', '--transfers', '4'"
+            'downLit'   = "'--local-no-check-updated'"
             'logLit'    = "'--log-level', 'INFO'"; 'rcLit'   = 'C:\app\rclone.exe'
             'metaLit'   = 'C:\work\_bridge';       'markLit' = '.coworkbridge-ok'
-            'codeMissingLit' = '90'; 'gateHoursLit' = '24'; 'consecLit' = '2'; 'throttleLit' = '3'
+            'codeMissingLit' = '90'; 'codeGuardLit' = '91'
+            'guardMinLit' = '10'; 'guardRatioLit' = '0.5'; 'throttleLit' = '3'
           }
           foreach ($k in $subs.Keys) { $body = $body -replace ('\$' + $k), $subs[$k] }
           $body = $body -replace '`\$', '$'
@@ -76,8 +80,43 @@ jobs:
           }
           Write-Host "sync-agent.ps1 (genere) : syntaxe OK"
 
+  # Banc de comportement. Le lint prouve que le script se parse ; celui-ci prouve qu'il
+  # synchronise. Deux dossiers locaux tiennent lieu de Drive et de dossier de travail, donc
+  # aucune dépendance à Google Drive pour ordinateur. Ce que ce banc ne couvre pas (placeholders
+  # non hydratés, ERROR 1450, corbeille Google) reste dans la checklist manuelle du CLAUDE.md.
+  test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: rclone (version épinglée, checksum vérifié)
+        shell: pwsh
+        run: |
+          $ver  = '1.74.3'
+          $zip  = "rclone-v$ver-windows-amd64.zip"
+          $base = "https://downloads.rclone.org/v$ver"
+          Invoke-WebRequest "$base/$zip" -OutFile $zip -UseBasicParsing
+          Invoke-WebRequest "$base/SHA256SUMS" -OutFile rclone-SHA256SUMS -UseBasicParsing
+          $line = Select-String -Path rclone-SHA256SUMS -SimpleMatch $zip | Select-Object -First 1
+          if (-not $line) { throw "Hash introuvable pour $zip dans SHA256SUMS" }
+          $expected = ($line.Line -split '\s+')[0].ToLower()
+          $actual   = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($expected -ne $actual) { throw "Checksum rclone invalide: $actual != $expected" }
+          Expand-Archive $zip -DestinationPath rclone-extract -Force
+          Copy-Item (Get-ChildItem rclone-extract -Recurse -Filter rclone.exe | Select-Object -First 1).FullName -Destination rclone.exe -Force
+
+      - name: Banc de synchronisation (Windows PowerShell 5.1)
+        shell: powershell   # la cible réelle du client, pas PS 7
+        run: |
+          .\tests\Run-Tests.ps1 -RclonePath "$PWD\rclone.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Le banc de synchronisation a echoue" }
+
   release:
     runs-on: windows-latest
+    needs: [lint, test]
+    permissions:
+      contents: write   # création de la Release
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
