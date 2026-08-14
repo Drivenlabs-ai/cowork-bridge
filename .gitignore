@@ -13,6 +13,10 @@ rclone-*.zip
 *.p12
 *.key
 
+# Notes de travail internes : diagnostics, plans, leçons. Le dépôt est public et ces notes
+# nomment des clients et des personnes. Elles restent sur la machine.
+tasks/
+
 # Cruft OS
 .DS_Store
 Thumbs.db
