@@ -68,18 +68,19 @@ That's it. From now on the sync runs on its own.
 
 ## How it works
 
-- **Engine:** [rclone](https://rclone.org) (bundled, MIT-licensed), running `bisync` between two local paths — the folder Google Drive mounts on your PC and your working folder. No OAuth, no cloud account, no remote: it only ever touches local paths.
+- **Engine:** [rclone](https://rclone.org) (bundled, MIT-licensed), running between two local paths — the folder Google Drive mounts on your PC and your working folder. No OAuth, no cloud account, no remote: it only ever touches local paths.
 - **Background sync:** a small resident agent watches your working folder and pushes your edits to Drive within seconds, and pulls changes from Drive on a schedule (every few minutes, configurable).
 - **Bundled, single installer:** rclone ships inside `CoworkBridge-Setup.exe`; you don't install or configure anything separately.
 
 ## Your files stay safe
 
-The two-way sync is built to never lose data:
+**Drive is the source of truth**, your working folder is where Claude Cowork reads and writes. Each pass sends up what this machine created, changed or removed, then brings the working folder back in line with Drive. Nothing is ever merged, so a file you delete on Drive stays deleted on every machine.
 
-- The first sync of a folder treats **Drive as the source of truth** and merges — it never deletes anything on the Drive side.
-- If the same file changed on both sides, **both versions are kept** (nothing is silently overwritten).
-- Deletions are mirrored, but a **dated local backup** of anything removed is kept (an undo bin), and Drive keeps its own trash.
-- A safety check **aborts the sync** if one side suddenly looks empty (e.g. Drive isn't mounted), instead of propagating a wipe.
+- The first sync of a folder only ever **pulls down** from Drive — it cannot delete anything on the Drive side.
+- If the same file changed on both sides, the **Drive version wins**, and yours is kept in a dated local backup (`_bridge\trash\`), never silently dropped.
+- Deletions travel both ways, with a safety net at each end: Google's own trash on the Drive side, the dated backup on yours.
+- A safety check **skips the pass** if the Drive folder isn't mounted, instead of reading it as empty and wiping your working folder.
+- If a lot of files vanish from your working folder at once, **nothing is deleted on Drive** — the folder is restored from it and the app tells you.
 
 ## Keeping it updated
 
