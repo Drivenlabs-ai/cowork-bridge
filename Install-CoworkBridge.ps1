@@ -899,7 +899,7 @@ function Read-Status([string]`$name) {
     try { return (Get-Content -LiteralPath `$f -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return `$null }
 }
 
-function Write-Status([string]`$name, [int]`$code, [bool]`$markResync, [bool]`$markForce, [bool]`$deleteSignal) {
+function Write-Status([string]`$name, [int]`$code) {
     # Mutex nomme : agent et panneau ecrivent le meme fichier ; serialise le read-modify-write
     # (l'ecriture atomique seule ne protege pas d'une mise a jour perdue). Best-effort (2 s).
     `$mtx = New-Object System.Threading.Mutex(`$false, 'Local\CoworkBridge-Status')
@@ -918,18 +918,9 @@ function Write-Status([string]`$name, [int]`$code, [bool]`$markResync, [bool]`$m
         if (`$code -eq 0) { `$lastSuccess = `$now; `$failures = 0 }
         elseif (`$code -eq $codeMissingLit) { }
         else { `$failures = `$failures + 1 }
-        `$lastAuto = Get-Field `$old 'lastAutoResync' `$null
-        if (`$lastAuto -is [datetime]) { `$lastAuto = `$lastAuto.ToString('o') }
-        if (`$markResync) { `$lastAuto = `$now }
-        `$deleteAborts = 0
-        if (`$deleteSignal) { `$deleteAborts = 1 + [int](Get-Field `$old 'deleteAborts' 0) }
-        `$lastForce = Get-Field `$old 'lastAutoForce' `$null
-        if (`$lastForce -is [datetime]) { `$lastForce = `$lastForce.ToString('o') }
-        if (`$markForce) { `$lastForce = `$now }
         `$st = [pscustomobject]@{
             name = `$name; lastRun = `$now; lastExit = `$code
-            lastSuccess = `$lastSuccess; failures = `$failures; lastAutoResync = `$lastAuto
-            deleteAborts = `$deleteAborts; lastAutoForce = `$lastForce
+            lastSuccess = `$lastSuccess; failures = `$failures
         }
         `$out  = Join-Path `$dir (`$name + '.json')
         `$json = ConvertTo-Json -InputObject `$st
@@ -1977,11 +1968,12 @@ function Start-Bridge {
 
     if ($existing -and @(Get-SortedSources $existing).Count -gt 0) {
         # Rafraîchit la config de synchro au lancement : un upgrade binaire ne relance pas Apply-Config,
-        # donc filters.txt ET l'agent résident garderaient l'ancien jeu (anciennes exclusions, pas de
-        # throttle --checkers). On régénère les deux ici pour qu'un client mis à jour en bénéficie.
-        # Filtres modifiés -> baselines invalidées : bisync hash le filters-file et abort
-        # « filters file has changed (must run --resync) » sinon ; le resync 'newer' repart proprement.
-        # Agent stoppé AVANT le swap (un bisync en vol recréerait sa baseline derrière le reset).
+        # donc filters.txt ET l'agent résident garderaient l'ancien jeu. On régénère les deux ici
+        # pour qu'un client mis à jour en bénéficie, et c'est aussi ici que l'état de l'ancien
+        # moteur est purgé, ce qui force une première passe en descente seule.
+        # Filtres modifiés -> index purgés : un fichier nouvellement exclu disparaît du relevé et
+        # serait pris pour une suppression à propager.
+        # Agent stoppé AVANT le swap (une passe en vol réécrirait ses index derrière le reset).
         # try/finally : l'agent est TOUJOURS réinstallé, même si le swap/re-pose de marqueurs lève
         # (sinon on aurait tué l'agent sans le relancer -> plus de synchro de fond jusqu'à réouverture).
         if (Test-UnderHome $existing.dest) {
