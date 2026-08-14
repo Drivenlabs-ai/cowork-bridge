@@ -30,7 +30,12 @@ $script:RcloneCommonFlags = @('--checkers', '1', '--transfers', '4', '--local-no
 $script:Rc = [pscustomobject]@{ Exe = $RclonePath }
 $script:Failures = 0
 $script:Ran = 0
+# Chemin NORMALISÉ : sur un runner Windows, $env:TEMP est en forme courte 8.3 (RUNNER~1) alors
+# que Get-ChildItem rend la forme longue. Retrancher une longueur de préfixe non normalisée
+# décale tous les chemins relatifs, et chaque comparaison de contenu échoue pour rien.
 $script:Root = Join-Path $env:TEMP ('cwb-tests-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+$script:Root = (Get-Item -LiteralPath $script:Root).FullName
 
 # ---------------------------------------------------------------- infrastructure
 
@@ -76,9 +81,11 @@ function Set-File {
 function Get-Content-Set {
     param([string]$Folder)
     if (-not (Test-Path -LiteralPath $Folder)) { return '' }
+    # Base normalisée avant de retrancher : voir la note sur $script:Root.
+    $base = (Get-Item -LiteralPath $Folder).FullName.TrimEnd('\', '/')
     $items = Get-ChildItem -LiteralPath $Folder -Recurse -File -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -ne $script:MarkerName } |
-        ForEach-Object { $_.FullName.Substring($Folder.Length + 1).Replace('\', '/') }
+        ForEach-Object { $_.FullName.Substring($base.Length + 1).Replace('\', '/') }
     return (($items | Sort-Object) -join ' ')
 }
 
