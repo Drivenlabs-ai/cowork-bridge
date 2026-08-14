@@ -88,7 +88,22 @@ function Assert-Equal {
 }
 
 function Assert-Code {
-    param([string]$Label, [int]$Expected, [int]$Actual)
+    param([string]$Label, [int]$Expected, $Actual)
+    # Une passe doit rendre UN entier. Si elle rend plusieurs objets, c'est qu'une instruction
+    # écrit dans le pipeline sans être capturée : on nomme le coupable plutôt que de laisser
+    # PowerShell se plaindre d'une conversion impossible.
+    if ($Actual -is [array]) {
+        Write-Host ("    ECHEC " + $Label + " : la passe a rendu " + $Actual.Count + " valeurs au lieu d'une") -ForegroundColor Red
+        for ($i = 0; $i -lt $Actual.Count; $i++) {
+            $v = $Actual[$i]
+            $tn = 'null'; if ($null -ne $v) { $tn = $v.GetType().FullName }
+            $txt = ''; if ($null -ne $v) { $txt = ($v | Out-String).Trim() }
+            if ($txt.Length -gt 120) { $txt = $txt.Substring(0, 120) }
+            Write-Host ("           [$i] ($tn) $txt") -ForegroundColor Red
+        }
+        $script:Failures++
+        return
+    }
     Assert-Equal $Label ([string]$Expected) ([string]$Actual)
 }
 

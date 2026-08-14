@@ -77,6 +77,10 @@ $script:RcloneLogFlags    = @('--log-level', 'INFO', '--log-file-max-size', '5M'
 # Code de sortie SYNTHÉTIQUE « côté Drive non monté » : hors de la plage rclone (0-10, dont 9 =
 # --error-on-no-transfer) pour éviter toute collision. N'est PAS un échec (ni succès) : neutre.
 $script:CodeDriveMissing = 90
+# -WindowStyle n'existe que sur l'édition Windows de Start-Process. La cible reste Windows ;
+# ce drapeau conditionnel rend seulement le banc de test exécutable ailleurs, ce qui donne une
+# boucle de mise au point sans passer par la CI. $IsWindows n'existe pas en PS 5.1.
+$script:OnWindows = ($env:OS -eq 'Windows_NT')
 # Garde-fou de suppression : le seul sens où une perte serait irréversible est local -> Drive.
 # Au-delà de ces deux seuils réunis, aucune suppression n'est propagée et la passe se contente
 # d'aligner le local sur le Drive. Couvre le dossier local vidé (profil abîmé, mauvaise
@@ -432,13 +436,21 @@ function Get-PairIndexPath([string]$MetaDir, [string]$LocalName, [string]$Side) 
 
 # Lance rclone et rend ses lignes de sortie. Start-Process + redirection plutôt que l'appel
 # direct : le panneau WinForms n'a pas de console, un « & rclone » y ferait clignoter une fenêtre.
+function Start-Rclone {
+    param([string]$RcloneExe, [string]$ArgLine, [string]$StdOut, [string]$StdErr)
+    $sp = @{ FilePath = $RcloneExe; ArgumentList = $ArgLine; PassThru = $true; Wait = $true }
+    if ($script:OnWindows) { $sp['WindowStyle'] = 'Hidden' }
+    if ($StdOut) { $sp['RedirectStandardOutput'] = $StdOut }
+    if ($StdErr) { $sp['RedirectStandardError'] = $StdErr }
+    return (Start-Process @sp)
+}
+
 function Invoke-RcloneCapture {
     param([string]$RcloneExe, [string]$ArgLine)
     $out = [System.IO.Path]::GetTempFileName()
     $err = [System.IO.Path]::GetTempFileName()
     try {
-        $p = Start-Process -FilePath $RcloneExe -ArgumentList $ArgLine -WindowStyle Hidden `
-                           -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -Wait
+        $p = Start-Rclone -RcloneExe $RcloneExe -ArgLine $ArgLine -StdOut $out -StdErr $err
         $lines = @()
         try { $lines = [System.IO.File]::ReadAllLines($out, [System.Text.Encoding]::UTF8) } catch {}
         return [pscustomobject]@{ Code = [int]$p.ExitCode; Lines = $lines }
@@ -528,7 +540,7 @@ function Write-FilesFromList([string]$Path, [string[]]$Items) {
 
 function Invoke-RcloneRun {
     param([string]$RcloneExe, [string]$ArgLine, [string]$Label)
-    $p = Start-Process -FilePath $RcloneExe -ArgumentList $ArgLine -WindowStyle Hidden -PassThru -Wait
+    $p = Start-Rclone -RcloneExe $RcloneExe -ArgLine $ArgLine
     Write-Log "$Label -> code $($p.ExitCode)"
     return [int]$p.ExitCode
 }
@@ -941,8 +953,10 @@ function Invoke-RcloneCapture([string]`$argLine) {
     `$out = [System.IO.Path]::GetTempFileName()
     `$err = [System.IO.Path]::GetTempFileName()
     try {
-        `$p = Start-Process -FilePath `$rclone -ArgumentList `$argLine -WindowStyle Hidden ``
-                           -RedirectStandardOutput `$out -RedirectStandardError `$err -PassThru -Wait
+        `$sp = @{ FilePath = `$rclone; ArgumentList = `$argLine; PassThru = `$true; Wait = `$true
+                 RedirectStandardOutput = `$out; RedirectStandardError = `$err }
+        if (`$env:OS -eq 'Windows_NT') { `$sp['WindowStyle'] = 'Hidden' }
+        `$p = Start-Process @sp
         `$lines = @()
         try { `$lines = [System.IO.File]::ReadAllLines(`$out, [System.Text.Encoding]::UTF8) } catch {}
         return [pscustomobject]@{ Code = [int]`$p.ExitCode; Lines = `$lines }
@@ -1022,7 +1036,9 @@ function Write-FilesFrom([string]`$path, [string[]]`$items) {
 
 function Invoke-Rclone([string]`$argLine) {
     try {
-        `$p = Start-Process -FilePath `$rclone -ArgumentList `$argLine -WindowStyle Hidden -Wait -PassThru
+        `$sp = @{ FilePath = `$rclone; ArgumentList = `$argLine; PassThru = `$true; Wait = `$true }
+        if (`$env:OS -eq 'Windows_NT') { `$sp['WindowStyle'] = 'Hidden' }
+        `$p = Start-Process @sp
         return [int]`$p.ExitCode
     } catch { return -1 }
 }
@@ -1394,7 +1410,7 @@ function Remove-TrackedFolder {
             $argLine = $argLine -join ' '
             $pushed = $false
             try {
-                $p = Start-Process -FilePath $Rclone.Exe -ArgumentList $argLine -WindowStyle Hidden -PassThru -Wait
+                $p = Start-Rclone -RcloneExe $Rclone.Exe -ArgLine $argLine
                 $pushed = ([int]$p.ExitCode -eq 0)
                 Write-Log "Unsync: copy local->Drive of '$($Source.Name)', code $($p.ExitCode)"
             } catch { Write-Log "Unsync: upload failed: $($_.Exception.Message)" 'WARN' }
